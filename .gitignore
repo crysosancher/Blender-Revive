@@ -21,3 +21,7 @@ logs/
 
 # Docker local data directories (if any local volumes are created)
 .docker-data/
+scripts/
+
+# Cached developer avatar
+dev_avatar.jpg

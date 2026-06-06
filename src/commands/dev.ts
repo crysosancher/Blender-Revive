@@ -1,4 +1,6 @@
 import { Command, sendHumanLikeResponse } from './index';
+import fs from 'fs';
+import path from 'path';
 
 /**
  * Dev command: Displays developer information and repository source links.
@@ -20,21 +22,42 @@ export const devCommand: Command = {
     text += `━━━━━━━━━━━━━━━━━━━━━━━━\n`;
     text += `⚡ _Powered by BlenderRevive Bot Core_`;
 
-    // Send response with the developer's GitHub avatar as media and description as caption
-    try {
-      await sendHumanLikeResponse(
-        sock,
-        jid,
-        {
-          image: { url: 'https://avatars.githubusercontent.com/u/77499291?s=400&u=9c45d7484e36a4d63d7ff0b73c8910f19982a54a&v=4' },
-          caption: text
-        },
-        { quoted: msg }
-      );
-    } catch (err) {
-      console.error('[DevCommand] Failed to send GitHub avatar image:', err);
-      // Fallback to text message if image sending fails
-      await sendHumanLikeResponse(sock, jid, { text }, { quoted: msg });
+    const localImagePath = path.join(process.cwd(), 'dev_avatar.jpg');
+
+    // Check if we already have it downloaded, or download it dynamically
+    let hasImage = fs.existsSync(localImagePath);
+    if (!hasImage) {
+      try {
+        const response = await fetch('https://avatars.githubusercontent.com/u/77499291?s=400&u=9c45d7484e36a4d63d7ff0b73c8910f19982a54a&v=4');
+        if (response.ok) {
+          const arrayBuffer = await response.arrayBuffer();
+          const buffer = Buffer.from(arrayBuffer);
+          fs.writeFileSync(localImagePath, buffer);
+          hasImage = true;
+        }
+      } catch (err) {
+        console.error('[DevCommand] Failed to download avatar image:', err);
+      }
     }
+
+    if (hasImage) {
+      try {
+        await sendHumanLikeResponse(
+          sock,
+          jid,
+          {
+            image: { url: localImagePath },
+            caption: text
+          },
+          { quoted: msg }
+        );
+        return;
+      } catch (err) {
+        console.error('[DevCommand] Failed to send media response:', err);
+      }
+    }
+
+    // Fallback to text message if image load/send fails
+    await sendHumanLikeResponse(sock, jid, { text }, { quoted: msg });
   },
 };
