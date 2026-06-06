@@ -19,10 +19,18 @@ const commandRegistry = new Map<string, Command>();
  * Registers a new command with the registry.
  */
 export function registerCommand(command: Command) {
-  commandRegistry.set(command.name.toLowerCase(), command);
+  const name = command.name.toLowerCase();
+  commandRegistry.set(name, command);
+  if (name.includes('_')) {
+    commandRegistry.set(name.replace(/_/g, '-'), command);
+  }
   if (command.aliases) {
     for (const alias of command.aliases) {
-      commandRegistry.set(alias.toLowerCase(), command);
+      const loweredAlias = alias.toLowerCase();
+      commandRegistry.set(loweredAlias, command);
+      if (loweredAlias.includes('_')) {
+        commandRegistry.set(loweredAlias.replace(/_/g, '-'), command);
+      }
     }
   }
 }
@@ -94,9 +102,63 @@ export async function sendHumanLikeResponse(
 }
 
 /**
+ * Validates if the sender of a message is an administrator (either defined in ADMIN_NUMBERS or a group administrator).
+ */
+export async function isSenderAdmin(sock: any, msg: proto.IWebMessageInfo): Promise<boolean> {
+  const jid = msg.key.remoteJid!;
+  const senderJid = msg.key.participant || msg.key.remoteJid!;
+
+  // 1. Bot owner/fromMe is always admin
+  if (msg.key.fromMe) return true;
+
+  // 2. Check env admin numbers
+  const adminEnv = process.env.ADMIN_NUMBERS || '';
+  const adminNumbers = adminEnv.split(',').map((n) => n.trim().replace(/\D/g, ''));
+  const senderNumber = senderJid.split('@')[0];
+  if (adminNumbers.includes(senderNumber)) return true;
+
+  // 3. If in group, check if sender is group admin
+  if (jid.endsWith('@g.us')) {
+    try {
+      const metadata = await sock.groupMetadata(jid);
+      const participant = metadata.participants.find((p: any) => p.id === senderJid);
+      return participant?.admin === 'admin' || participant?.admin === 'superadmin';
+    } catch (err) {
+      console.error('[AdminCheck] Failed to fetch group metadata:', err);
+    }
+  }
+
+  return false;
+}
+
+/**
  * Core command dispatcher. Parses the message body, matches it to a registered command,
  * and executes the command asynchronously.
  */
+/**
+ * Computes the Levenshtein distance between two strings.
+ */
+function getLevenshteinDistance(a: string, b: string): number {
+  const tmp: number[][] = [];
+  let i: number, j: number;
+  for (i = 0; i <= a.length; i++) {
+    tmp[i] = [i];
+  }
+  for (j = 0; j <= b.length; j++) {
+    tmp[0][j] = j;
+  }
+  for (i = 1; i <= a.length; i++) {
+    for (j = 1; j <= b.length; j++) {
+      tmp[i][j] = Math.min(
+        tmp[i - 1][j] + 1, // deletion
+        tmp[i][j - 1] + 1, // insertion
+        tmp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1) // substitution
+      );
+    }
+  }
+  return tmp[a.length][b.length];
+}
+
 export async function handleIncomingMessage(sock: any, msg: proto.IWebMessageInfo): Promise<void> {
   const jid = msg.key.remoteJid;
   if (!jid) return;
@@ -119,7 +181,38 @@ export async function handleIncomingMessage(sock: any, msg: proto.IWebMessageInf
   const args = parts.slice(1);
 
   const command = commandRegistry.get(commandName);
-  if (!command) return;
+  if (!command) {
+    // Find the closest matching registered command name or alias
+    let closestMatch: string | null = null;
+    let minDistance = Infinity;
+
+    for (const key of commandRegistry.keys()) {
+      const dist = getLevenshteinDistance(commandName, key);
+      if (dist < minDistance) {
+        minDistance = dist;
+        closestMatch = key;
+      }
+    }
+
+    // Determine if the match is close enough (e.g. threshold based on command length)
+    const threshold = Math.max(2, Math.floor(commandName.length / 2));
+    if (closestMatch && minDistance <= threshold) {
+      await sendHumanLikeResponse(
+        sock,
+        jid,
+        { text: `❓ *Did you mean:* \`${prefix}${closestMatch}\`?\n\nType \`${prefix}help\` to see a list of all available commands.` },
+        { quoted: msg }
+      );
+    } else {
+      await sendHumanLikeResponse(
+        sock,
+        jid,
+        { text: `⚠️ *Unknown command.* \n\nType \`${prefix}help\` to see a list of all available commands.` },
+        { quoted: msg }
+      );
+    }
+    return;
+  }
 
   console.log(`[Command] Found and executing: ${prefix}${commandName} from ${msg.pushName || 'User'} in chat ${jid}`);
 
@@ -141,6 +234,20 @@ export async function handleIncomingMessage(sock: any, msg: proto.IWebMessageInf
 // Import and register all commands
 import { pingCommand } from './ping';
 import { helpCommand } from './help';
+import { 
+  regRefCommand, 
+  updateRefCommand, 
+  refListCommand, 
+  refUpdateCommand, 
+  refDeleteCommand,
+  tagunregCommand
+} from './referral';
 
 registerCommand(pingCommand);
 registerCommand(helpCommand);
+registerCommand(regRefCommand);
+registerCommand(updateRefCommand);
+registerCommand(refListCommand);
+registerCommand(refUpdateCommand);
+registerCommand(refDeleteCommand);
+registerCommand(tagunregCommand);

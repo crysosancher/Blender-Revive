@@ -58,6 +58,20 @@ export async function queueMessage(msg: proto.IWebMessageInfo): Promise<void> {
 }
 
 /**
+ * Retrieves the count of waiting, active, delayed, and paused jobs in the queue.
+ */
+export async function getQueueCount(): Promise<number> {
+  if (!messageQueue) return 0;
+  try {
+    const counts = await messageQueue.getJobCounts('wait', 'active', 'delayed', 'paused');
+    return (counts.wait || 0) + (counts.active || 0) + (counts.delayed || 0) + (counts.paused || 0);
+  } catch (err) {
+    console.error('[Queue] Failed to get job counts:', err);
+    return 0;
+  }
+}
+
+/**
  * Starts the BullMQ Worker to process queued messages.
  * Concurrency controls how many messages are processed in parallel.
  * Accepts a getSocket getter function to always retrieve the active connection socket.

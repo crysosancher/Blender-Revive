@@ -10,6 +10,9 @@ import dotenv from 'dotenv';
 import { getDb } from './db/mongodb';
 import { useMongoDBAuthState } from './auth/mongo-auth';
 import { queueMessage } from './queue/message-queue';
+import { storeLidPhoneMapping, captureGroupParticipantMappings } from './db/lid-phone-map';
+import fs from 'fs';
+import path from 'path';
 
 dotenv.config();
 
@@ -19,6 +22,16 @@ dotenv.config();
 const logger = pino({ level: 'warn' });
 
 let sockInstance: any = null;
+
+/**
+ * Utility to normalize JIDs.
+ */
+function cleanJid(jid: string): string {
+  const parts = jid.split('@');
+  const user = parts[0].split(':')[0];
+  const domain = parts[1] || 's.whatsapp.net';
+  return `${user}@${domain}`;
+}
 
 /**
  * Returns the active WhatsApp socket instance.
@@ -74,6 +87,80 @@ export async function startWhatsAppBot(): Promise<any> {
     await saveCreds();
   });
 
+  // 1b. Capture LID → Phone JID mappings from WhatsApp's phone number sharing protocol.
+  // This fires when WhatsApp reveals the phone number behind a LID.
+  sock.ev.on('chats.phoneNumberShare', async ({ lid, jid }) => {
+    console.log(`[Bot] Phone number share captured: ${lid} -> ${jid}`);
+    await storeLidPhoneMapping(lid, jid);
+  });
+
+  // 1c. Capture LID↔Phone mappings from contact sync events.
+  // These fire during history sync and whenever contacts are updated.
+  // Contact objects may contain both `lid` (LID) and `id`/`jid` (phone) fields.
+  const captureContactMappings = async (contacts: Array<{ id: string; lid?: string; jid?: string; name?: string; notify?: string; verifiedName?: string }>) => {
+    const referralsCollection = getDb().collection('referrals');
+    for (const contact of contacts) {
+      const lid = contact.id?.endsWith('@lid') ? contact.id : (contact.lid?.endsWith('@lid') ? contact.lid : null);
+      const phoneJid = contact.id?.endsWith('@s.whatsapp.net') ? contact.id : (contact.jid?.endsWith('@s.whatsapp.net') ? contact.jid : null);
+
+      if (lid && phoneJid) {
+        await storeLidPhoneMapping(lid, phoneJid);
+      }
+
+      // Capture and update name if available and username is currently 'Unknown'
+      const name = contact.notify || contact.name || contact.verifiedName;
+      if (name && name !== 'Unknown') {
+        try {
+          if (lid) {
+            const res = await referralsCollection.updateOne(
+              { _id: lid, username: 'Unknown' } as any,
+              { $set: { username: name } }
+            );
+            if (res.modifiedCount > 0) {
+              console.log(`[Bot] Updated username for LID ${lid} to: ${name}`);
+            }
+          }
+          if (phoneJid) {
+            let res = await referralsCollection.updateOne(
+              { _id: phoneJid, username: 'Unknown' } as any,
+              { $set: { username: name } }
+            );
+            if (res.modifiedCount > 0) {
+              console.log(`[Bot] Updated username for Phone JID ${phoneJid} to: ${name}`);
+            }
+            // Also update by the phoneJid field inside the document
+            res = await referralsCollection.updateOne(
+              { phoneJid: phoneJid, username: 'Unknown' } as any,
+              { $set: { username: name } }
+            );
+            if (res.modifiedCount > 0) {
+              console.log(`[Bot] Updated username by phoneJid field for ${phoneJid} to: ${name}`);
+            }
+          }
+        } catch (err) {
+          console.error('[Bot] Failed to update username from contact info:', err);
+        }
+      }
+    }
+  };
+
+  sock.ev.on('contacts.upsert', async (contacts: any[]) => {
+    console.log(`[Bot] Contacts upsert: ${contacts.length} contacts received, scanning for LID mappings...`);
+    await captureContactMappings(contacts);
+  });
+
+  sock.ev.on('contacts.update', async (contacts: any[]) => {
+    await captureContactMappings(contacts);
+  });
+
+  // 1d. Capture mappings from history sync (contains contacts with both id and lid)
+  sock.ev.on('messaging-history.set', async ({ contacts }: any) => {
+    if (contacts && Array.isArray(contacts)) {
+      console.log(`[Bot] History sync: ${contacts.length} contacts, scanning for LID mappings...`);
+      await captureContactMappings(contacts);
+    }
+  });
+
   // 2. Connection updates (QR generation, opened, closed)
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -89,6 +176,28 @@ export async function startWhatsAppBot(): Promise<any> {
 
     if (connection === 'open') {
       console.log('[Bot] Connection successfully established with WhatsApp!');
+
+      // Background: Scan all groups to harvest LID↔Phone participant mappings & usernames.
+      // This runs once on each connection open, building the mapping table so
+      // DM mentions can resolve LIDs to clickable phone JIDs.
+      setTimeout(async () => {
+        try {
+          console.log('[Bot] Starting background group scan for LID→Phone mappings and usernames...');
+          const groups = await sock.groupFetchAllParticipating();
+          const groupIds = Object.keys(groups);
+
+          for (const gid of groupIds) {
+            const group = groups[gid];
+            if (group.participants) {
+              await captureGroupParticipantMappings(group.participants);
+            }
+          }
+
+          console.log(`[Bot] Group scan complete: ${groupIds.length} groups scanned.`);
+        } catch (err) {
+          console.error('[Bot] Background group scan failed (non-fatal):', err);
+        }
+      }, 5000); // Wait 5s after connection to avoid flooding
     }
 
     if (connection === 'close') {
@@ -115,6 +224,55 @@ export async function startWhatsAppBot(): Promise<any> {
       for (const msg of m.messages) {
         // Optimization: Pre-filter out messages without body content (e.g. protocol messages) before queueing
         if (!msg.message) continue;
+
+        // Capture and update name if available and username is currently 'Unknown'
+        const senderJid = msg.key.participant || msg.key.remoteJid;
+        const pushName = msg.pushName;
+        if (senderJid && pushName && pushName !== 'Unknown') {
+          const cleanSender = cleanJid(senderJid);
+          try {
+            const referralsCollection = getDb().collection('referrals');
+            await referralsCollection.updateOne(
+              { _id: cleanSender, username: 'Unknown' } as any,
+              { $set: { username: pushName } }
+            );
+            if (cleanSender.endsWith('@s.whatsapp.net')) {
+              await referralsCollection.updateOne(
+                { phoneJid: cleanSender, username: 'Unknown' } as any,
+                { $set: { username: pushName } }
+              );
+            }
+          } catch (err) {
+            // ignore
+          }
+        }
+
+        // Log incoming DM messages to a file
+        const jid = msg.key.remoteJid;
+        if (jid && !jid.endsWith('@g.us') && jid !== 'status@broadcast' && !msg.key.fromMe) {
+          try {
+            const logsDir = path.join(__dirname, '../logs');
+            if (!fs.existsSync(logsDir)) {
+              fs.mkdirSync(logsDir, { recursive: true });
+            }
+            const logFilePath = path.join(logsDir, 'dm-messages.log');
+            const logEntry = {
+              timestamp: new Date().toISOString(),
+              remoteJid: jid,
+              pushName: msg.pushName,
+              message: msg,
+            };
+            const serialized = JSON.stringify(logEntry, (key, val) => {
+              if (val && (val.type === 'Buffer' || val instanceof Uint8Array || (val.constructor && val.constructor.name === 'Uint8Array'))) {
+                return '[Buffer/Uint8Array]';
+              }
+              return val;
+            }, 2);
+            fs.appendFileSync(logFilePath, `${serialized}\n---\n`);
+          } catch (err) {
+            console.error('[Bot] Failed to log DM message:', err);
+          }
+        }
 
         try {
           // Push to Redis Queue for async processing
