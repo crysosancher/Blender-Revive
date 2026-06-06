@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Compiled files
+dist/
+
+# Configuration and credentials
+.env
+.env*.local
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+logs/
+*.log
+
+# Docker local data directories (if any local volumes are created)
+.docker-data/
