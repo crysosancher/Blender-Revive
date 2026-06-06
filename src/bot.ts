@@ -98,49 +98,74 @@ export async function startWhatsAppBot(): Promise<any> {
   // These fire during history sync and whenever contacts are updated.
   // Contact objects may contain both `lid` (LID) and `id`/`jid` (phone) fields.
   const captureContactMappings = async (contacts: Array<{ id: string; lid?: string; jid?: string; name?: string; notify?: string; verifiedName?: string }>) => {
-    const referralsCollection = getDb().collection('referrals');
+    const db = getDb();
+    const mapCollection = db.collection('lid_phone_map');
+    const referralsCollection = db.collection('referrals');
+
+    const mapOps: any[] = [];
+    const referralOps: any[] = [];
+
     for (const contact of contacts) {
       const lid = contact.id?.endsWith('@lid') ? contact.id : (contact.lid?.endsWith('@lid') ? contact.lid : null);
       const phoneJid = contact.id?.endsWith('@s.whatsapp.net') ? contact.id : (contact.jid?.endsWith('@s.whatsapp.net') ? contact.jid : null);
 
       if (lid && phoneJid) {
-        await storeLidPhoneMapping(lid, phoneJid);
+        mapOps.push({
+          updateOne: {
+            filter: { _id: lid },
+            update: {
+              $set: {
+                phoneJid,
+                updatedAt: new Date(),
+              },
+            },
+            upsert: true,
+          },
+        });
       }
 
       // Capture and update name if available and username is currently 'Unknown'
       const name = contact.notify || contact.name || contact.verifiedName;
       if (name && name !== 'Unknown') {
-        try {
-          if (lid) {
-            const res = await referralsCollection.updateOne(
-              { _id: lid, username: 'Unknown' } as any,
-              { $set: { username: name } }
-            );
-            if (res.modifiedCount > 0) {
-              console.log(`[Bot] Updated username for LID ${lid} to: ${name}`);
+        if (lid) {
+          referralOps.push({
+            updateOne: {
+              filter: { _id: lid, username: 'Unknown' } as any,
+              update: { $set: { username: name } }
             }
-          }
-          if (phoneJid) {
-            let res = await referralsCollection.updateOne(
-              { _id: phoneJid, username: 'Unknown' } as any,
-              { $set: { username: name } }
-            );
-            if (res.modifiedCount > 0) {
-              console.log(`[Bot] Updated username for Phone JID ${phoneJid} to: ${name}`);
+          });
+        }
+        if (phoneJid) {
+          referralOps.push({
+            updateOne: {
+              filter: { _id: phoneJid, username: 'Unknown' } as any,
+              update: { $set: { username: name } }
             }
-            // Also update by the phoneJid field inside the document
-            res = await referralsCollection.updateOne(
-              { phoneJid: phoneJid, username: 'Unknown' } as any,
-              { $set: { username: name } }
-            );
-            if (res.modifiedCount > 0) {
-              console.log(`[Bot] Updated username by phoneJid field for ${phoneJid} to: ${name}`);
+          });
+          referralOps.push({
+            updateOne: {
+              filter: { phoneJid: phoneJid, username: 'Unknown' } as any,
+              update: { $set: { username: name } }
             }
-          }
-        } catch (err) {
-          console.error('[Bot] Failed to update username from contact info:', err);
+          });
         }
       }
+    }
+
+    try {
+      const promises: Promise<any>[] = [];
+      if (mapOps.length > 0) {
+        promises.push(mapCollection.bulkWrite(mapOps, { ordered: false }));
+      }
+      if (referralOps.length > 0) {
+        promises.push(referralsCollection.bulkWrite(referralOps, { ordered: false }));
+      }
+      if (promises.length > 0) {
+        await Promise.all(promises);
+        console.log(`[Bot] Bulk mapped ${mapOps.length} contacts and processed ${referralOps.length} username updates.`);
+      }
+    } catch (err) {
+      console.error('[Bot] Bulk contact write failed:', err);
     }
   };
 

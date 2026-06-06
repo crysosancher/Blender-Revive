@@ -50,7 +50,7 @@ export const pingCommand: Command = {
     const memPercent = ((usedMem / totalMem) * 100).toFixed(1);
 
     const uptime = formatUptime(os.uptime());
-    const queueCount = await getQueueCount();
+    const queueCount = Math.max(0, (await getQueueCount()) - 1);
     const rawCpu = os.cpus()[0]?.model || 'Apple Silicon';
     const cpu = rawCpu.trim().replace(/\s+/g, ' '); // Clean up duplicate spacing
 

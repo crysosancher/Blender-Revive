@@ -194,59 +194,84 @@ export async function captureGroupParticipantMappings(
   participants: Array<{ id: string; lid?: string; jid?: string; name?: string; notify?: string; verifiedName?: string }>
 ): Promise<void> {
   const db = getDb();
+  const mapCollection = db.collection(COLLECTION_NAME);
   const referralsCollection = db.collection('referrals');
+
+  const mapOps: any[] = [];
+  const referralOps: any[] = [];
 
   for (const p of participants) {
     const lid = p.id.endsWith('@lid') ? p.id : (p.lid?.endsWith('@lid') ? p.lid : null);
     const phoneJid = p.id.endsWith('@s.whatsapp.net') ? p.id : (p.jid?.endsWith('@s.whatsapp.net') ? p.jid : null);
 
-    // Case 1: id is LID, jid field has phone
+    // Collect LID-to-phone mappings
+    let hasMapping = false;
     if (p.id.endsWith('@lid') && p.jid?.endsWith('@s.whatsapp.net')) {
-      await storeLidPhoneMapping(p.id, p.jid);
+      hasMapping = true;
+    } else if (p.id.endsWith('@s.whatsapp.net') && p.lid?.endsWith('@lid')) {
+      hasMapping = true;
+    } else if (p.lid?.endsWith('@lid') && p.jid?.endsWith('@s.whatsapp.net')) {
+      hasMapping = true;
     }
-    // Case 2: id is phone, lid field has LID
-    else if (p.id.endsWith('@s.whatsapp.net') && p.lid?.endsWith('@lid')) {
-      await storeLidPhoneMapping(p.lid, p.id);
-    }
-    // Case 3: Both lid and jid fields present
-    else if (p.lid?.endsWith('@lid') && p.jid?.endsWith('@s.whatsapp.net')) {
-      await storeLidPhoneMapping(p.lid, p.jid);
+
+    if (lid && phoneJid && hasMapping) {
+      mapOps.push({
+        updateOne: {
+          filter: { _id: lid },
+          update: {
+            $set: {
+              phoneJid,
+              updatedAt: new Date(),
+            },
+          },
+          upsert: true,
+        },
+      });
     }
 
     // Capture and update name if available and username is currently 'Unknown'
     const name = p.notify || p.name || p.verifiedName;
     if (name && name !== 'Unknown') {
-      try {
-        if (lid) {
-          const res = await referralsCollection.updateOne(
-            { _id: lid, username: 'Unknown' } as any,
-            { $set: { username: name } }
-          );
-          if (res.modifiedCount > 0) {
-            console.log(`[LidPhoneMap] Updated username for LID ${lid} to: ${name}`);
+      if (lid) {
+        referralOps.push({
+          updateOne: {
+            filter: { _id: lid, username: 'Unknown' } as any,
+            update: { $set: { username: name } }
           }
-        }
-        if (phoneJid) {
-          let res = await referralsCollection.updateOne(
-            { _id: phoneJid, username: 'Unknown' } as any,
-            { $set: { username: name } }
-          );
-          if (res.modifiedCount > 0) {
-            console.log(`[LidPhoneMap] Updated username for Phone JID ${phoneJid} to: ${name}`);
+        });
+      }
+      if (phoneJid) {
+        referralOps.push({
+          updateOne: {
+            filter: { _id: phoneJid, username: 'Unknown' } as any,
+            update: { $set: { username: name } }
           }
-          // Also update by the phoneJid field inside the document
-          res = await referralsCollection.updateOne(
-            { phoneJid: phoneJid, username: 'Unknown' } as any,
-            { $set: { username: name } }
-          );
-          if (res.modifiedCount > 0) {
-            console.log(`[LidPhoneMap] Updated username by phoneJid field for ${phoneJid} to: ${name}`);
+        });
+        referralOps.push({
+          updateOne: {
+            filter: { phoneJid: phoneJid, username: 'Unknown' } as any,
+            update: { $set: { username: name } }
           }
-        }
-      } catch (err) {
-        console.error('[LidPhoneMap] Failed to update username from participant info:', err);
+        });
       }
     }
+  }
+
+  // Execute bulk writes
+  try {
+    const promises: Promise<any>[] = [];
+    if (mapOps.length > 0) {
+      promises.push(mapCollection.bulkWrite(mapOps, { ordered: false }));
+    }
+    if (referralOps.length > 0) {
+      promises.push(referralsCollection.bulkWrite(referralOps, { ordered: false }));
+    }
+    if (promises.length > 0) {
+      await Promise.all(promises);
+      console.log(`[LidPhoneMap] Bulk updated ${mapOps.length} mappings and processed ${referralOps.length} username updates.`);
+    }
+  } catch (err) {
+    console.error('[LidPhoneMap] Bulk write failed for group participants:', err);
   }
 }
 

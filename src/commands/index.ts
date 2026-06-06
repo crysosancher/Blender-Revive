@@ -83,7 +83,7 @@ export async function sendHumanLikeResponse(
   // Calculate realistic typing speed delay:
   // Roughly 30ms per character. We cap it between 1 second and 3.5 seconds
   // so the bot remains responsive while still looking human.
-  const textLength = content.text ? content.text.length : 0;
+  const textLength = content.text ? content.text.length : (content.caption ? content.caption.length : 0);
   const typingDelayMs = Math.min(Math.max(textLength * 30, 1000), 3500);
 
   await new Promise((resolve) => setTimeout(resolve, typingDelayMs));
@@ -138,7 +138,7 @@ export async function isSenderAdmin(sock: any, msg: proto.IWebMessageInfo): Prom
 /**
  * Computes the Levenshtein distance between two strings.
  */
-function getLevenshteinDistance(a: string, b: string): number {
+export function getLevenshteinDistance(a: string, b: string): number {
   const tmp: number[][] = [];
   let i: number, j: number;
   for (i = 0; i <= a.length; i++) {
@@ -172,8 +172,23 @@ export async function handleIncomingMessage(sock: any, msg: proto.IWebMessageInf
   const text = getMessageText(msg).trim();
   if (!text) return;
 
+  const isDm = !jid.endsWith('@g.us');
+
   // Check if message starts with the designated command prefix
-  if (!text.startsWith(prefix)) return;
+  if (!text.startsWith(prefix)) {
+    if (isDm) {
+      // In DM, if the message is not a command, prompt them to use help or contact the developer
+      await sendHumanLikeResponse(
+        sock,
+        jid,
+        {
+          text: `🤖 *BlenderRevive Bot*\n━━━━━━━━━━━━━━━━━━━━━━━━\n\nI didn't recognize that message as a command.\n\n💡 Please use \`${prefix}help\` to see a list of all available commands.\n\n👤 Or contact my developer, *Virat Pandey*:\n- GitHub: https://github.com/crysosancher\n- LinkedIn: https://linkedin.com/in/crysosancher`
+        },
+        { quoted: msg }
+      );
+    }
+    return;
+  }
 
   // Parse command name and arguments
   const parts = text.slice(prefix.length).trim().split(/\s+/);
@@ -204,12 +219,23 @@ export async function handleIncomingMessage(sock: any, msg: proto.IWebMessageInf
         { quoted: msg }
       );
     } else {
-      await sendHumanLikeResponse(
-        sock,
-        jid,
-        { text: `⚠️ *Unknown command.* \n\nType \`${prefix}help\` to see a list of all available commands.` },
-        { quoted: msg }
-      );
+      if (isDm) {
+        await sendHumanLikeResponse(
+          sock,
+          jid,
+          {
+            text: `⚠️ *Unknown command.*\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n💡 Type \`${prefix}help\` to see all available commands.\n\n👤 Or contact my developer, *Virat Pandey*:\n- GitHub: https://github.com/crysosancher\n- LinkedIn: https://linkedin.com/in/crysosancher`
+          },
+          { quoted: msg }
+        );
+      } else {
+        await sendHumanLikeResponse(
+          sock,
+          jid,
+          { text: `⚠️ *Unknown command.* \n\nType \`${prefix}help\` to see a list of all available commands.` },
+          { quoted: msg }
+        );
+      }
     }
     return;
   }
@@ -240,8 +266,10 @@ import {
   refListCommand, 
   refUpdateCommand, 
   refDeleteCommand,
-  tagunregCommand
+  tagunregCommand,
+  companyCommand
 } from './referral';
+import { devCommand } from './dev';
 
 registerCommand(pingCommand);
 registerCommand(helpCommand);
@@ -251,3 +279,5 @@ registerCommand(refListCommand);
 registerCommand(refUpdateCommand);
 registerCommand(refDeleteCommand);
 registerCommand(tagunregCommand);
+registerCommand(companyCommand);
+registerCommand(devCommand);

@@ -1,4 +1,4 @@
-import { Command, sendHumanLikeResponse, isSenderAdmin } from './index';
+import { Command, sendHumanLikeResponse, isSenderAdmin, getLevenshteinDistance } from './index';
 import { getDb } from '../db/mongodb';
 import { batchResolvePhoneJids, captureGroupParticipantMappings, storeLidPhoneMapping } from '../db/lid-phone-map';
 import { proto } from '@whiskeysockets/baileys';
@@ -15,6 +15,7 @@ interface ReferralDoc {
   phoneJid?: string; // Resolved phone JID ending in @s.whatsapp.net
   createdAt: Date;
   updatedAt?: Date;
+  deletedAt?: Date; // Added for soft delete support
 }
 
 /**
@@ -26,6 +27,97 @@ function cleanUserJid(jid: string): string {
   const domain = parts[1] || 's.whatsapp.net';
   return `${user}@${domain}`;
 }
+
+/**
+ * Sanitizes a company name by capitalizing the first letter of each word and replacing spaces with underscores.
+ */
+function sanitizeCompanyName(name: string): string {
+  if (!name) return '';
+  return name
+    .trim()
+    .split(/[_\s]+/) // Split by spaces or underscores
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join('_');
+}
+
+/**
+ * Escapes special regex characters in a string.
+ */
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Resolves a company name by checking for exact matches, substring matches, or close typos in the database.
+ * If a match is found, returns the matched company name and a boolean indicating if it was a suggestion.
+ * If no match is found, returns the sanitized input.
+ */
+async function resolveCompanySanity(rawName: string): Promise<{ matched: string; isSuggested: boolean }> {
+  const sanitized = sanitizeCompanyName(rawName);
+  if (!sanitized) return { matched: '', isSuggested: false };
+
+  const referralsCollection = getDb().collection<ReferralDoc>('referrals');
+
+  // 1. Check exact/case-insensitive match (not soft-deleted)
+  const exactMatch = await referralsCollection.findOne({
+    company: { $regex: new RegExp(`^${escapeRegex(sanitized)}$`, 'i') },
+    deletedAt: { $exists: false }
+  } as any);
+
+  if (exactMatch) {
+    return { matched: exactMatch.company, isSuggested: false };
+  }
+
+  // Get all unique companies (not soft-deleted)
+  const allCompanies = await referralsCollection.distinct('company', { deletedAt: { $exists: false } });
+  if (allCompanies.length === 0) {
+    return { matched: sanitized, isSuggested: false };
+  }
+
+  // 2. Try substring matching
+  const substringMatches = allCompanies.filter((c) =>
+    c.toLowerCase().includes(sanitized.toLowerCase())
+  );
+
+  if (substringMatches.length > 0) {
+    substringMatches.sort((a, b) => {
+      const aStarts = a.toLowerCase().startsWith(sanitized.toLowerCase());
+      const bStarts = b.toLowerCase().startsWith(sanitized.toLowerCase());
+      if (aStarts && !bStarts) return -1;
+      if (!aStarts && bStarts) return 1;
+      return a.length - b.length;
+    });
+    return { matched: substringMatches[0], isSuggested: true };
+  }
+
+  // 3. Try Levenshtein fuzzy matching
+  let closestMatch: string | null = null;
+  let minDistance = Infinity;
+
+  for (const company of allCompanies) {
+    const dist = getLevenshteinDistance(sanitized.toLowerCase(), company.toLowerCase());
+    if (dist < minDistance) {
+      minDistance = dist;
+      closestMatch = company;
+    }
+  }
+
+  let threshold = 3;
+  if (sanitized.length <= 3) {
+    threshold = 1;
+  } else if (sanitized.length <= 6) {
+    threshold = 2;
+  }
+
+  if (closestMatch && minDistance <= threshold) {
+    return { matched: closestMatch, isSuggested: true };
+  }
+
+  // No match found - treat as a brand new company name
+  return { matched: sanitized, isSuggested: false };
+}
+
 
 /**
  * Resolves the phone-based JID (@s.whatsapp.net) of the sender from a message key,
@@ -106,8 +198,8 @@ export const regRefCommand: Command = {
       await storeLidPhoneMapping(senderJid, phoneJid);
     }
 
-    const companyName = args.join(' ').trim();
-    if (!companyName) {
+    const rawCompanyName = args.join(' ').trim();
+    if (!rawCompanyName) {
       await sendHumanLikeResponse(
         sock,
         jid,
@@ -116,12 +208,13 @@ export const regRefCommand: Command = {
       );
       return;
     }
+    const { matched: companyName, isSuggested } = await resolveCompanySanity(rawCompanyName);
 
     const referralsCollection = getDb().collection<ReferralDoc>('referrals');
 
-    // Check if user is already registered under any company
+    // Check if user is already registered under any company (not soft-deleted)
     const existing = await referralsCollection.findOne({ _id: senderJid } as any);
-    if (existing) {
+    if (existing && !existing.deletedAt) {
       // If we found a phoneJid now but didn't have it before, update it retroactively
       if (phoneJid && !existing.phoneJid) {
         await referralsCollection.updateOne({ _id: senderJid } as any, { $set: { phoneJid } });
@@ -136,22 +229,33 @@ export const regRefCommand: Command = {
       return;
     }
 
-    // Insert new registration record
-    await referralsCollection.insertOne({
-      _id: senderJid,
-      company: companyName,
-      username: pushName,
-      phoneJid,
-      createdAt: new Date(),
-    });
+    // Insert new or restore/overwrite soft-deleted registration record
+    await referralsCollection.updateOne(
+      { _id: senderJid } as any,
+      {
+        $set: {
+          company: companyName,
+          username: pushName,
+          phoneJid,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+        $unset: { deletedAt: "" }
+      },
+      { upsert: true }
+    );
 
     const formatted = formatUser(senderJid, pushName, jid, phoneJid);
+
+    const companyStr = isSuggested 
+      ? `${companyName} _(closest match for "${rawCompanyName}")_` 
+      : companyName;
 
     await sendHumanLikeResponse(
       sock,
       jid,
       {
-        text: `✅ *Registered Successfully*\n*Company:* ${companyName}\n*User:* ${formatted.text}`,
+        text: `✅ *Registered Successfully*\n*Company:* ${companyStr}\n*User:* ${formatted.text}`,
         mentions: formatted.mentions,
       },
       { quoted: msg }
@@ -178,8 +282,8 @@ export const updateRefCommand: Command = {
       await storeLidPhoneMapping(senderJid, phoneJid);
     }
 
-    const newCompany = args.join(' ').trim();
-    if (!newCompany) {
+    const rawNewCompany = args.join(' ').trim();
+    if (!rawNewCompany) {
       await sendHumanLikeResponse(
         sock,
         jid,
@@ -188,10 +292,11 @@ export const updateRefCommand: Command = {
       );
       return;
     }
+    const { matched: newCompany, isSuggested } = await resolveCompanySanity(rawNewCompany);
 
     const referralsCollection = getDb().collection<ReferralDoc>('referrals');
 
-    const existing = await referralsCollection.findOne({ _id: senderJid } as any);
+    const existing = await referralsCollection.findOne({ _id: senderJid, deletedAt: { $exists: false } } as any);
     if (!existing) {
       await sendHumanLikeResponse(
         sock,
@@ -217,11 +322,15 @@ export const updateRefCommand: Command = {
       }
     );
 
+    const companyStr = isSuggested 
+      ? `${newCompany} _(closest match for "${rawNewCompany}")_` 
+      : newCompany;
+
     await sendHumanLikeResponse(
       sock,
       jid,
       {
-        text: `✅ *Company Updated Successfully*\n*Old Company:* ${oldCompany}\n*New Company:* ${newCompany}`,
+        text: `✅ *Company Updated Successfully*\n*Old Company:* ${oldCompany}\n*New Company:* ${companyStr}`,
       },
       { quoted: msg }
     );
@@ -245,7 +354,7 @@ export const refListCommand: Command = {
     const currentPhoneJid = resolvePhoneJid(msg);
     if (currentPhoneJid) {
       await referralsCollection.updateOne(
-        { _id: senderJid, phoneJid: { $exists: false } } as any,
+        { _id: senderJid, phoneJid: { $exists: false }, deletedAt: { $exists: false } } as any,
         { $set: { phoneJid: currentPhoneJid } }
       );
       // Also store in the LID mapping if sender uses LID
@@ -254,17 +363,20 @@ export const refListCommand: Command = {
       }
     }
 
-    // If in a group, capture LID→Phone mappings from all group participants
+    // If in a group, capture LID→Phone mappings from all group participants in the background
     if (jid.endsWith('@g.us')) {
-      try {
-        const metadata = await sock.groupMetadata(jid);
-        await captureGroupParticipantMappings(metadata.participants);
-      } catch (err) {
-        console.error('[RefList] Failed to capture group participant mappings:', err);
-      }
+      sock.groupMetadata(jid)
+        .then((metadata: any) => {
+          captureGroupParticipantMappings(metadata.participants).catch((err) => {
+            console.error('[RefList] Failed to process group participant mappings:', err);
+          });
+        })
+        .catch((err: any) => {
+          console.error('[RefList] Failed to fetch group metadata:', err);
+        });
     }
 
-    const allRecords = await referralsCollection.find({}).toArray();
+    const allRecords = await referralsCollection.find({ deletedAt: { $exists: false } }).toArray();
 
     // DEBUG: Log all record data to understand what JIDs and phone JIDs are stored
     console.log('[RefList] DEBUG - All records:');
@@ -311,24 +423,149 @@ export const refListCommand: Command = {
       grouped[record.company].push(record);
     }
 
-    let text = `🏢 *Registered Companies & Users*\n\n`;
+    let text = `🏢 *Registered Referral Directory*\n`;
+    text += `━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
     const allMentions: string[] = [];
 
     // Sort company names alphabetically
     const sortedCompanies = Object.keys(grouped).sort((a, b) => a.localeCompare(b));
 
     for (const company of sortedCompanies) {
-      text += `*${company}*\n`;
+      const count = grouped[company].length;
+      text += `🏢 *${company}* (${count} ${count === 1 ? 'user' : 'users'})\n`;
       for (const record of grouped[company]) {
         const resolvedPhone = resolvePhoneForRecord(record);
         const formatted = formatUser(record._id, record.username, jid, record.phoneJid, resolvedPhone);
-        text += `  • ${formatted.text}\n`;
+        text += `  └ 👤 ${formatted.text}\n`;
         if (formatted.mentions.length > 0) {
           allMentions.push(...formatted.mentions);
         }
       }
       text += `\n`;
     }
+
+    text += `━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+    text += `📊 *Summary:* ${sortedCompanies.length} Companies | ${allRecords.length} Users`;
+
+    await sendHumanLikeResponse(
+      sock,
+      jid,
+      {
+        text: text.trim(),
+        mentions: allMentions,
+      },
+      { quoted: msg }
+    );
+  },
+};
+
+/**
+ * Command: -company [<Company Name>]
+ * Lists all registered companies, or shows users registered under a specific company.
+ */
+export const companyCommand: Command = {
+  name: 'company',
+  aliases: ['companies'],
+  description: 'Lists registered companies or gets users under a specific company.',
+  execute: async (sock, msg, args) => {
+    const jid = msg.key.remoteJid!;
+    const referralsCollection = getDb().collection<ReferralDoc>('referrals');
+
+    // Case 1: No arguments - show list of all companies
+    if (args.length === 0) {
+      const allRecords = await referralsCollection.find({ deletedAt: { $exists: false } }).toArray();
+      if (allRecords.length === 0) {
+        await sendHumanLikeResponse(
+          sock,
+          jid,
+          { text: '🏢 *No registered companies found.*' },
+          { quoted: msg }
+        );
+        return;
+      }
+
+      // Count users per company
+      const companyCounts: { [company: string]: number } = {};
+      for (const r of allRecords) {
+        companyCounts[r.company] = (companyCounts[r.company] || 0) + 1;
+      }
+
+      const sortedCompanies = Object.keys(companyCounts).sort((a, b) => a.localeCompare(b));
+
+      let text = `🏢 *Registered Companies List*\n`;
+      text += `━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+      sortedCompanies.forEach((company, index) => {
+        const count = companyCounts[company];
+        text += `${index + 1}. *${company}* (${count} ${count === 1 ? 'user' : 'users'})\n`;
+      });
+
+      text += `\n━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+      text += `💡 _Tip: Use \`${prefix}company <company_name>\` to view users registered under that company._`;
+
+      await sendHumanLikeResponse(
+        sock,
+        jid,
+        { text: text.trim() },
+        { quoted: msg }
+      );
+      return;
+    }
+
+    // Case 2: Company name is provided - find registrations under it
+    const rawTargetCompany = args.join(' ').trim();
+    const { matched: matchedCompany, isSuggested } = await resolveCompanySanity(rawTargetCompany);
+
+    // Search case-insensitively using regex
+    const records = await referralsCollection.find({
+      company: { $regex: new RegExp(`^${escapeRegex(matchedCompany)}$`, 'i') },
+      deletedAt: { $exists: false }
+    } as any).toArray();
+
+    if (records.length === 0) {
+      await sendHumanLikeResponse(
+        sock,
+        jid,
+        { text: `❌ *No referrals found for company:* *${matchedCompany}*` },
+        { quoted: msg }
+      );
+      return;
+    }
+
+    // Actively resolve all LID-based user JIDs to phone JIDs
+    const lidJids = records
+      .filter((r) => r._id.endsWith('@lid') && !r.phoneJid)
+      .map((r) => r._id);
+    
+    let lidPhoneMap = new Map<string, string>();
+    if (lidJids.length > 0) {
+      lidPhoneMap = await batchResolvePhoneJids(sock, lidJids);
+    }
+
+    const resolvePhoneForRecord = (record: ReferralDoc): string | undefined => {
+      if (record.phoneJid?.endsWith('@s.whatsapp.net')) return record.phoneJid;
+      if (record._id.endsWith('@lid')) return lidPhoneMap.get(record._id);
+      if (record._id.endsWith('@s.whatsapp.net')) return record._id;
+      return undefined;
+    };
+
+    let text = isSuggested
+      ? `🏢 *Referrals for ${matchedCompany}* _(showing closest match for "${rawTargetCompany}")_\n`
+      : `🏢 *Referrals for ${matchedCompany}*\n`;
+    text += `━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    const allMentions: string[] = [];
+    for (const record of records) {
+      const resolvedPhone = resolvePhoneForRecord(record);
+      const formatted = formatUser(record._id, record.username, jid, record.phoneJid, resolvedPhone);
+      text += `👤 ${formatted.text}\n`;
+      if (formatted.mentions.length > 0) {
+        allMentions.push(...formatted.mentions);
+      }
+    }
+
+    text += `\n━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+    text += `📊 *Total:* ${records.length} ${records.length === 1 ? 'user' : 'users'}`;
 
     await sendHumanLikeResponse(
       sock,
@@ -373,14 +610,16 @@ export const refUpdateCommand: Command = {
       return;
     }
 
-    const oldCompany = args[0];
-    const newCompany = args.slice(1).join(' ').trim();
+    const rawOldCompany = args[0];
+    const rawNewCompany = args.slice(1).join(' ').trim();
+    const oldCompany = sanitizeCompanyName(rawOldCompany);
+    const newCompany = sanitizeCompanyName(rawNewCompany);
 
     const referralsCollection = getDb().collection<ReferralDoc>('referrals');
 
-    // Match company case-insensitively using regex
+    // Match company case-insensitively using regex (only active ones)
     const updateResult = await referralsCollection.updateMany(
-      { company: { $regex: new RegExp(`^${oldCompany}$`, 'i') } } as any,
+      { company: { $regex: new RegExp(`^${escapeRegex(oldCompany)}$`, 'i') }, deletedAt: { $exists: false } } as any,
       {
         $set: {
           company: newCompany,
@@ -431,8 +670,8 @@ export const refDeleteCommand: Command = {
       return;
     }
 
-    const targetCompany = args.join(' ').trim();
-    if (!targetCompany) {
+    const rawTargetCompany = args.join(' ').trim();
+    if (!rawTargetCompany) {
       await sendHumanLikeResponse(
         sock,
         jid,
@@ -441,15 +680,21 @@ export const refDeleteCommand: Command = {
       );
       return;
     }
+    const targetCompany = sanitizeCompanyName(rawTargetCompany);
 
     const referralsCollection = getDb().collection<ReferralDoc>('referrals');
 
-    // Delete matches case-insensitively using regex
-    const deleteResult = await referralsCollection.deleteMany({
-      company: { $regex: new RegExp(`^${targetCompany}$`, 'i') },
-    } as any);
+    // Soft-delete matches case-insensitively using regex by setting deletedAt field
+    const deleteResult = await referralsCollection.updateMany(
+      { company: { $regex: new RegExp(`^${escapeRegex(targetCompany)}$`, 'i') }, deletedAt: { $exists: false } } as any,
+      {
+        $set: {
+          deletedAt: new Date(),
+        },
+      }
+    );
 
-    if (deleteResult.deletedCount === 0) {
+    if (deleteResult.modifiedCount === 0) {
       await sendHumanLikeResponse(
         sock,
         jid,
@@ -463,7 +708,7 @@ export const refDeleteCommand: Command = {
       sock,
       jid,
       {
-        text: `✅ *Company Deleted Successfully*\n_Removed registrations: ${deleteResult.deletedCount}_`,
+        text: `✅ *Company Soft-Deleted Successfully*\n_Deactivated registrations: ${deleteResult.modifiedCount}_`,
       },
       { quoted: msg }
     );
@@ -522,17 +767,21 @@ export const tagunregCommand: Command = {
 
     const participants = metadata.participants;
 
-    // 4. Fetch all registered users from database
-    const allRegistered = await referralsCollection.find({}).toArray();
+    // 4. Fetch all registered users from database (excluding soft-deleted)
+    const allRegistered = await referralsCollection.find({ deletedAt: { $exists: false } }).toArray();
     const registeredJids = new Set(allRegistered.map((r) => cleanUserJid(r._id)));
 
     // Get connection details to exclude the bot's own number
-    const botJid = cleanUserJid(sock.user.id);
+    const envBotNumber = process.env.BOT_NUMBER || '';
+    const cleanEnvBotNumber = envBotNumber.replace(/\D/g, ''); // Extract only digits
+    const botJid = sock.user?.id ? cleanUserJid(sock.user.id) : '';
 
     // 5. Filter for unregistered participants
     const unregistered = participants.filter((p: any) => {
       const cleanJid = cleanUserJid(p.id);
-      return !registeredJids.has(cleanJid) && cleanJid !== botJid;
+      const isBot = (botJid && cleanJid === botJid) || 
+                    (cleanEnvBotNumber && cleanJid.split('@')[0] === cleanEnvBotNumber);
+      return !registeredJids.has(cleanJid) && !isBot;
     });
 
     if (unregistered.length === 0) {

@@ -1,6 +1,21 @@
-version: '3.8'
-
 services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: whatsapp-bot
+    restart: always
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./logs:/app/logs
+    env_file:
+      - .env
+    environment:
+      - REDIS_HOST=redis
+    depends_on:
+      - redis
+
   redis:
     image: redis:alpine
     container_name: whatsapp-bot-redis
