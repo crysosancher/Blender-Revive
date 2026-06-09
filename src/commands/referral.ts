@@ -2,9 +2,11 @@ import { Command, sendHumanLikeResponse, isSenderDev, getLevenshteinDistance } f
 import { getDb } from '../db/mongodb';
 import { batchResolvePhoneJids, captureGroupParticipantMappings, storeLidPhoneMapping } from '../db/lid-phone-map';
 import { proto } from '@whiskeysockets/baileys';
+import { verifyAndNormalizeCompany, runDatabaseCompanyNormalization, flushStaleVerifications, CompanyVerificationDoc } from '../services/company-verifier';
 import dotenv from 'dotenv';
 
 dotenv.config();
+
 
 const prefix = process.env.BOT_PREFIX || '-';
 
@@ -208,7 +210,11 @@ export const regRefCommand: Command = {
       );
       return;
     }
-    const { matched: companyName, isSuggested } = await resolveCompanySanity(rawCompanyName);
+
+    // Call verifyAndNormalizeCompany to normalize and check ranking
+    const verification = await verifyAndNormalizeCompany(rawCompanyName);
+    const companyName = verification.canonicalName;
+    const displayCompanyName = verification.displayName;
 
     const referralsCollection = getDb().collection<ReferralDoc>('referrals');
 
@@ -223,7 +229,7 @@ export const regRefCommand: Command = {
       await sendHumanLikeResponse(
         sock,
         jid,
-        { text: `⚠️ You are already registered under *${existing.company}*. Use \`${prefix}update_ref <New Company>\` if you wish to change it.` },
+        { text: `⚠️ You are already registered under *${existing.company.replace(/_/g, ' ')}*. Use \`${prefix}update_ref <New Company>\` if you wish to change it.` },
         { quoted: msg }
       );
       return;
@@ -234,7 +240,7 @@ export const regRefCommand: Command = {
       { _id: senderJid } as any,
       {
         $set: {
-          company: companyName,
+          company: companyName, // Normalized name
           username: pushName,
           phoneJid,
           createdAt: new Date(),
@@ -247,15 +253,14 @@ export const regRefCommand: Command = {
 
     const formatted = formatUser(senderJid, pushName, jid, phoneJid);
 
-    const companyStr = isSuggested 
-      ? `${companyName} _(closest match for "${rawCompanyName}")_` 
-      : companyName;
+    const badge = verification.rank === 'A' ? '⭐ ' : (verification.rank === 'B' ? '✅ ' : '');
+    const rankText = verification.rank !== 'unranked' ? ` (Rank ${verification.rank})` : '';
 
     await sendHumanLikeResponse(
       sock,
       jid,
       {
-        text: `✅ *Registered Successfully*\n*Company:* ${companyStr}\n*User:* ${formatted.text}`,
+        text: `✅ *Registered Successfully*\n*Company:* ${badge}${displayCompanyName}${rankText}\n*User:* ${formatted.text}`,
         mentions: formatted.mentions,
       },
       { quoted: msg }
@@ -292,7 +297,11 @@ export const updateRefCommand: Command = {
       );
       return;
     }
-    const { matched: newCompany, isSuggested } = await resolveCompanySanity(rawNewCompany);
+
+    // Call verifyAndNormalizeCompany to normalize and check ranking
+    const verification = await verifyAndNormalizeCompany(rawNewCompany);
+    const newCompany = verification.canonicalName;
+    const displayCompanyName = verification.displayName;
 
     const referralsCollection = getDb().collection<ReferralDoc>('referrals');
 
@@ -314,7 +323,7 @@ export const updateRefCommand: Command = {
       { _id: senderJid } as any,
       {
         $set: {
-          company: newCompany,
+          company: newCompany, // Normalized name
           username: pushName,
           phoneJid: phoneJid || existing.phoneJid,
           updatedAt: new Date(),
@@ -322,15 +331,14 @@ export const updateRefCommand: Command = {
       }
     );
 
-    const companyStr = isSuggested 
-      ? `${newCompany} _(closest match for "${rawNewCompany}")_` 
-      : newCompany;
+    const badge = verification.rank === 'A' ? '⭐ ' : (verification.rank === 'B' ? '✅ ' : '');
+    const rankText = verification.rank !== 'unranked' ? ` (Rank ${verification.rank})` : '';
 
     await sendHumanLikeResponse(
       sock,
       jid,
       {
-        text: `✅ *Company Updated Successfully*\n*Old Company:* ${oldCompany}\n*New Company:* ${companyStr}`,
+        text: `✅ *Company Updated Successfully*\n*Old Company:* ${oldCompany.replace(/_/g, ' ')}\n*New Company:* ${badge}${displayCompanyName}${rankText}`,
       },
       { quoted: msg }
     );
@@ -347,11 +355,101 @@ export const refListCommand: Command = {
   description: 'Lists all companies and registered users.',
   execute: async (sock, msg) => {
     const jid = msg.key.remoteJid!;
+
+    // Check if developer. If not, show disabled message.
+    if (!(await isSenderDev(sock, msg))) {
+      await sendHumanLikeResponse(
+        sock,
+        jid,
+        {
+          text: `🚫 *Command Disabled*\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ The \`${prefix}reflist\` command is temporarily disabled.\n\n💡 Please register using \`${prefix}reg-ref <companyName>\` first, then use \`${prefix}company\` to check company data.`
+        },
+        { quoted: msg }
+      );
+      return;
+    }
+
+    // Developer execution - show all registered users grouped by company
+    const referralsCollection = getDb().collection<ReferralDoc>('referrals');
+    const allRecords = await referralsCollection.find({ deletedAt: { $exists: false } }).toArray();
+
+    if (allRecords.length === 0) {
+      await sendHumanLikeResponse(
+        sock,
+        jid,
+        { text: '🏢 *No registered users found.*' },
+        { quoted: msg }
+      );
+      return;
+    }
+
+    // Fetch cached company verifications to display standardized company names
+    const verificationsCol = getDb().collection<CompanyVerificationDoc>('company_verifications');
+    const verifications = await verificationsCol.find({}).toArray();
+    const verificationsMap = new Map<string, CompanyVerificationDoc>();
+    for (const v of verifications) {
+      verificationsMap.set(v._id, v);
+      if (v.canonicalName) {
+        verificationsMap.set(v.canonicalName.toUpperCase().replace(/[\s_]+/g, '_'), v);
+      }
+    }
+
+    // Actively resolve all LID-based user JIDs to phone JIDs
+    const lidJids = allRecords
+      .filter((r) => r._id.endsWith('@lid') && !r.phoneJid)
+      .map((r) => r._id);
+    
+    let lidPhoneMap = new Map<string, string>();
+    if (lidJids.length > 0) {
+      lidPhoneMap = await batchResolvePhoneJids(sock, lidJids);
+    }
+
+    const resolvePhoneForRecord = (record: ReferralDoc): string | undefined => {
+      if (record.phoneJid?.endsWith('@s.whatsapp.net')) return record.phoneJid;
+      if (record._id.endsWith('@lid')) return lidPhoneMap.get(record._id);
+      if (record._id.endsWith('@s.whatsapp.net')) return record._id;
+      return undefined;
+    };
+
+    // Group records by company
+    const grouped: { [company: string]: ReferralDoc[] } = {};
+    for (const record of allRecords) {
+      if (!grouped[record.company]) {
+        grouped[record.company] = [];
+      }
+      grouped[record.company].push(record);
+    }
+
+    let text = `👑 *Developer Console: Registered Referrals List*\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+    const allMentions: string[] = [];
+
+    // Sort company names alphabetically
+    const sortedCompanies = Object.keys(grouped).sort((a, b) => a.localeCompare(b));
+
+    for (const company of sortedCompanies) {
+      const lookupKey = company.toUpperCase().replace(/[\s_]+/g, '_');
+      const cache = verificationsMap.get(lookupKey);
+      const displayName = cache ? cache.displayName : company.replace(/_/g, ' ');
+      const badge = cache ? (cache.rank === 'A' ? '⭐ ' : (cache.rank === 'B' ? '✅ ' : '❓ ')) : '❓ ';
+
+      text += `🏢 *${badge}${displayName}*\n`;
+      for (const record of grouped[company]) {
+        const resolvedPhone = resolvePhoneForRecord(record);
+        const formatted = formatUser(record._id, record.username, jid, record.phoneJid, resolvedPhone);
+        text += `  • ${formatted.text}\n`;
+        if (formatted.mentions.length > 0) {
+          allMentions.push(...formatted.mentions);
+        }
+      }
+      text += `\n`;
+    }
+
     await sendHumanLikeResponse(
       sock,
       jid,
       {
-        text: `🚫 *Command Disabled*\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ The \`${prefix}reflist\` command is temporarily disabled.\n\n💡 Please register using \`${prefix}reg-ref <companyName>\` first, then use \`${prefix}company\` to check company data.`
+        text: text.trim(),
+        mentions: allMentions,
       },
       { quoted: msg }
     );
@@ -392,6 +490,17 @@ export const companyCommand: Command = {
       return;
     }
 
+    // Fetch cached company verifications
+    const verificationsCol = getDb().collection<CompanyVerificationDoc>('company_verifications');
+    const verifications = await verificationsCol.find({}).toArray();
+    const verificationsMap = new Map<string, CompanyVerificationDoc>();
+    for (const v of verifications) {
+      verificationsMap.set(v._id, v);
+      if (v.canonicalName) {
+        verificationsMap.set(v.canonicalName.toUpperCase().replace(/[\s_]+/g, '_'), v);
+      }
+    }
+
     // Case 1: No arguments - show list of all companies
     if (args.length === 0) {
       const allRecords = await referralsCollection.find({ deletedAt: { $exists: false } }).toArray();
@@ -413,15 +522,61 @@ export const companyCommand: Command = {
 
       const sortedCompanies = Object.keys(companyCounts).sort((a, b) => a.localeCompare(b));
 
+      const rankA: { displayName: string; canonicalName: string; count: number }[] = [];
+      const rankB: { displayName: string; canonicalName: string; count: number }[] = [];
+      const unranked: { displayName: string; canonicalName: string; count: number }[] = [];
+
+      for (const company of sortedCompanies) {
+        const count = companyCounts[company];
+        const lookupKey = company.toUpperCase().replace(/[\s_]+/g, '_');
+        const cache = verificationsMap.get(lookupKey);
+        const displayName = cache ? cache.displayName : company.replace(/_/g, ' ');
+        const rank = cache ? cache.rank : 'unranked';
+
+        const entry = { displayName, canonicalName: company, count };
+        if (rank === 'A') {
+          rankA.push(entry);
+        } else if (rank === 'B') {
+          rankB.push(entry);
+        } else {
+          unranked.push(entry);
+        }
+      }
+
+      // Sort display names alphabetically within each rank
+      const sortByDisplayName = (a: any, b: any) => a.displayName.localeCompare(b.displayName);
+      rankA.sort(sortByDisplayName);
+      rankB.sort(sortByDisplayName);
+      unranked.sort(sortByDisplayName);
+
       let text = `🏢 *Registered Companies List*\n`;
       text += `━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
 
-      sortedCompanies.forEach((company, index) => {
-        const count = companyCounts[company];
-        text += `${index + 1}. *${company}* (${count} ${count === 1 ? 'user' : 'users'})\n`;
-      });
+      if (rankA.length > 0) {
+        text += `⭐ *Rank A (MNCs & Enterprise)*\n`;
+        rankA.forEach((c) => {
+          text += `- *${c.displayName}* (${c.count} ${c.count === 1 ? 'user' : 'users'})\n`;
+        });
+        text += `\n`;
+      }
 
-      text += `\n━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+      if (rankB.length > 0) {
+        text += `✅ *Rank B (Startups & Mid-size)*\n`;
+        rankB.forEach((c) => {
+          text += `- *${c.displayName}* (${c.count} ${c.count === 1 ? 'user' : 'users'})\n`;
+        });
+        text += `\n`;
+      }
+
+      if (unranked.length > 0) {
+        text += `❓ *Unverified / Unranked*\n`;
+        unranked.forEach((c) => {
+          text += `- *${c.displayName}* (${c.count} ${c.count === 1 ? 'user' : 'users'})\n`;
+        });
+        text += `\n`;
+      }
+
+      text += `━━━━━━━━━━━━━━━━━━━━━━━━\n`;
       text += `💡 _Tip: Use \`${prefix}company <company_name>\` to view users registered under that company._`;
 
       await sendHumanLikeResponse(
@@ -435,11 +590,20 @@ export const companyCommand: Command = {
 
     // Case 2: Company name is provided - find registrations under it
     const rawTargetCompany = args.join(' ').trim();
-    const { matched: matchedCompany, isSuggested } = await resolveCompanySanity(rawTargetCompany);
 
-    // Search case-insensitively using regex
+    // Call verifyAndNormalizeCompany to check ranking and canonical name
+    const verification = await verifyAndNormalizeCompany(rawTargetCompany);
+    const matchedCompany = verification.canonicalName;
+    const displayCompanyName = verification.displayName;
+    const badge = verification.rank === 'A' ? '⭐ ' : (verification.rank === 'B' ? '✅ ' : '❓ ');
+
+    // Robust matching for database query
     const records = await referralsCollection.find({
-      company: { $regex: new RegExp(`^${escapeRegex(matchedCompany)}$`, 'i') },
+      $or: [
+        { company: matchedCompany },
+        { company: { $regex: new RegExp(`^${escapeRegex(matchedCompany.replace(/_/g, ' '))}$`, 'i') } },
+        { company: { $regex: new RegExp(`^${escapeRegex(rawTargetCompany)}$`, 'i') } }
+      ],
       deletedAt: { $exists: false }
     } as any).toArray();
 
@@ -447,7 +611,7 @@ export const companyCommand: Command = {
       await sendHumanLikeResponse(
         sock,
         jid,
-        { text: `❌ *No referrals found for company:* *${matchedCompany}*` },
+        { text: `❌ *No referrals found for company:* *${displayCompanyName}*` },
         { quoted: msg }
       );
       return;
@@ -470,9 +634,10 @@ export const companyCommand: Command = {
       return undefined;
     };
 
-    let text = isSuggested
-      ? `🏢 *Referrals for ${matchedCompany}* _(showing closest match for "${rawTargetCompany}")_\n`
-      : `🏢 *Referrals for ${matchedCompany}*\n`;
+    let text = `🏢 *Referrals for ${badge}${displayCompanyName}*\n`;
+    if (verification.justification) {
+      text += `💡 _${verification.justification}_\n`;
+    }
     text += `━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
 
     const allMentions: string[] = [];
@@ -736,3 +901,70 @@ export const tagunregCommand: Command = {
     );
   },
 };
+
+/**
+ * Command: -verify_cron
+ * Admin/Dev Command: Manually runs the company verification and database normalization job.
+ */
+export const verifyCronCommand: Command = {
+  name: 'verify_cron',
+  aliases: ['verify-cron', 'verifycron', 'normalize_db'],
+  description: 'Dev: Manually runs the company verification and database normalization. Use "-flash" or "-flush" to clear stale cache first.',
+  execute: async (sock, msg) => {
+    const jid = msg.key.remoteJid!;
+
+    // Validate dev rights
+    if (!(await isSenderDev(sock, msg))) {
+      await sendHumanLikeResponse(
+        sock,
+        jid,
+        { text: '❌ *Access Denied:* Only developers can trigger this command.' },
+        { quoted: msg }
+      );
+      return;
+    }
+
+    // Check for flush/flash flag in the message body
+    const body = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
+    const shouldFlush = body.toLowerCase().includes('flush') || body.toLowerCase().includes('flash');
+
+    let flushMsg = '';
+    if (shouldFlush) {
+      try {
+        const flushed = await flushStaleVerifications();
+        flushMsg = `\n🗑️ *Cache Flushed:* ${flushed} stale fallback entries purged.`;
+      } catch (flushErr: any) {
+        console.error('[VerifyCron] Cache flush failed:', flushErr);
+        flushMsg = `\n⚠️ *Cache flush failed:* ${flushErr.message || flushErr}`;
+      }
+    }
+
+    await sendHumanLikeResponse(
+      sock,
+      jid,
+      { text: `⚙️ *Running company normalization & verification check...*${flushMsg}\nThis may take a few seconds.` },
+      { quoted: msg }
+    );
+
+    try {
+      const { checked, updatedReferrals, apiCalls } = await runDatabaseCompanyNormalization();
+      await sendHumanLikeResponse(
+        sock,
+        jid,
+        {
+          text: `✅ *Database Normalization Complete!*\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n📊 *Results:*\n- Companies Checked: *${checked}*\n- Referrals Normalised/Updated: *${updatedReferrals}*\n- Gemini API Calls: *${apiCalls}*${shouldFlush ? '\n- Stale Cache: *Flushed* ✅' : ''}`
+        },
+        { quoted: msg }
+      );
+    } catch (err: any) {
+      console.error('[VerifyCron] Normalization failed:', err);
+      await sendHumanLikeResponse(
+        sock,
+        jid,
+        { text: `❌ *Error:* Failed to run company normalization: ${err.message || err}` },
+        { quoted: msg }
+      );
+    }
+  }
+};
+

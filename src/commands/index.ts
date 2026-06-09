@@ -105,16 +105,64 @@ export async function sendHumanLikeResponse(
  * Validates if the sender of a message is the developer (either defined in DEVELOPER_NUMBER or fromMe).
  */
 export async function isSenderDev(sock: any, msg: proto.IWebMessageInfo): Promise<boolean> {
-  const senderJid = msg.key.participant || msg.key.remoteJid!;
-
   // 1. Bot owner/fromMe is always developer
   if (msg.key.fromMe) return true;
 
-  // 2. Check env developer numbers
+  const senderJid = msg.key.participant || msg.key.remoteJid!;
+  console.log('[isSenderDev] Initial sender JID:', senderJid);
+
+  // Resolve the phone number JID from the LID if needed
+  let resolvedJid = senderJid;
+
+  if (senderJid.endsWith('@lid')) {
+    const jid = msg.key.remoteJid!;
+    // A. Check Baileys message metadata
+    if (jid.endsWith('@s.whatsapp.net')) {
+      resolvedJid = jid;
+    } else if (jid.endsWith('@g.us')) {
+      const part = msg.key.participant;
+      const partAlt = (msg.key as any).participantAlt;
+      if (part?.endsWith('@s.whatsapp.net')) resolvedJid = part;
+      else if (partAlt?.endsWith('@s.whatsapp.net')) resolvedJid = partAlt;
+    } else {
+      const remoteAlt = (msg.key as any).remoteJidAlt;
+      if (remoteAlt?.endsWith('@s.whatsapp.net')) resolvedJid = remoteAlt;
+    }
+    console.log('[isSenderDev] Resolved from metadata:', resolvedJid);
+
+    // B. If still LID, query database mappings and cache
+    if (resolvedJid.endsWith('@lid')) {
+      try {
+        const { getPhoneJidFromLid } = await import('../db/lid-phone-map');
+        const phoneJid = await getPhoneJidFromLid(resolvedJid);
+        if (phoneJid) {
+          resolvedJid = phoneJid;
+        } else {
+          const { getDb } = await import('../db/mongodb');
+          const db = getDb();
+          const existing = await db.collection('referrals').findOne({ _id: resolvedJid } as any);
+          if (existing && existing.phoneJid) {
+            resolvedJid = existing.phoneJid;
+          }
+        }
+      } catch (err) {
+        // Ignore DB/import errors
+      }
+    }
+  }
+
+  // 2. Check env developer numbers (handles country code mismatches like 917070224546 vs 7070224546)
   const devEnv = process.env.DEVELOPER_NUMBER || '';
   const devNumbers = devEnv.split(',').map((n) => n.trim().replace(/\D/g, ''));
-  const senderNumber = senderJid.split('@')[0];
-  if (devNumbers.includes(senderNumber)) return true;
+  const senderNumber = resolvedJid.split('@')[0];
+  
+  const isMatch = devNumbers.some((devNum) => {
+    return senderNumber === devNum || 
+           (senderNumber.length >= 10 && senderNumber.endsWith(devNum)) || 
+           (devNum.length >= 10 && devNum.endsWith(senderNumber));
+  });
+
+  if (isMatch) return true;
 
   return false;
 }
@@ -255,7 +303,8 @@ import {
   refUpdateCommand, 
   refDeleteCommand,
   tagunregCommand,
-  companyCommand
+  companyCommand,
+  verifyCronCommand
 } from './referral';
 import { devCommand } from './dev';
 
@@ -268,4 +317,6 @@ registerCommand(refUpdateCommand);
 registerCommand(refDeleteCommand);
 registerCommand(tagunregCommand);
 registerCommand(companyCommand);
+registerCommand(verifyCronCommand);
 registerCommand(devCommand);
+

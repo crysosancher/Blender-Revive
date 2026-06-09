@@ -8,7 +8,7 @@ let messageQueue: Queue | null = null;
 let messageWorker: Worker | null = null;
 
 interface MessageJobData {
-  messageStr: string;
+  messageStr?: string;
 }
 
 /**
@@ -28,6 +28,22 @@ export function setupQueue(): Queue {
       removeOnComplete: true, // Clean up to avoid Redis memory bloat
       removeOnFail: 100,      // Keep last 100 failures for debugging
     },
+  });
+
+  // Schedule repeatable company verification cron job (runs twice a day: at midnight and noon)
+  messageQueue.add(
+    'company-verification-cron',
+    {},
+    {
+      repeat: {
+        pattern: '0 0,12 * * *',
+      },
+      jobId: 'company-verification-cron-job',
+    }
+  ).then(() => {
+    console.log('[Queue] Repeatable company verification cron job successfully scheduled');
+  }).catch((err) => {
+    console.error('[Queue] Failed to schedule company verification cron:', err);
   });
 
   console.log('[Queue] Message queue successfully initialized');
@@ -82,7 +98,24 @@ export function setupWorker(getSocket: () => any, concurrency: number = 5): Work
   messageWorker = new Worker<MessageJobData>(
     'whatsapp-message-queue',
     async (job) => {
+      // Handle repeatable company verification cron job
+      if (job.name === 'company-verification-cron') {
+        console.log('[Worker] Starting cron task: Company Verification & Normalization...');
+        try {
+          const { runDatabaseCompanyNormalization } = await import('../services/company-verifier');
+          const { checked, updatedReferrals } = await runDatabaseCompanyNormalization();
+          console.log(`[Worker] Cron task complete: checked ${checked} companies, updated ${updatedReferrals} referrals.`);
+        } catch (err) {
+          console.error('[Worker] Cron task failed:', err);
+          throw err;
+        }
+        return;
+      }
+
       const { messageStr } = job.data;
+      if (!messageStr) {
+        throw new Error('[Worker] Message job data messageStr is missing.');
+      }
       const msg = JSON.parse(messageStr, BufferJSON.reviver) as proto.IWebMessageInfo;
 
       const sock = getSocket();
