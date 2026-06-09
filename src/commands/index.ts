@@ -102,31 +102,19 @@ export async function sendHumanLikeResponse(
 }
 
 /**
- * Validates if the sender of a message is an administrator (either defined in ADMIN_NUMBERS or a group administrator).
+ * Validates if the sender of a message is the developer (either defined in DEVELOPER_NUMBER or fromMe).
  */
-export async function isSenderAdmin(sock: any, msg: proto.IWebMessageInfo): Promise<boolean> {
-  const jid = msg.key.remoteJid!;
+export async function isSenderDev(sock: any, msg: proto.IWebMessageInfo): Promise<boolean> {
   const senderJid = msg.key.participant || msg.key.remoteJid!;
 
-  // 1. Bot owner/fromMe is always admin
+  // 1. Bot owner/fromMe is always developer
   if (msg.key.fromMe) return true;
 
-  // 2. Check env admin numbers
-  const adminEnv = process.env.ADMIN_NUMBERS || '';
-  const adminNumbers = adminEnv.split(',').map((n) => n.trim().replace(/\D/g, ''));
+  // 2. Check env developer numbers
+  const devEnv = process.env.DEVELOPER_NUMBER || '';
+  const devNumbers = devEnv.split(',').map((n) => n.trim().replace(/\D/g, ''));
   const senderNumber = senderJid.split('@')[0];
-  if (adminNumbers.includes(senderNumber)) return true;
-
-  // 3. If in group, check if sender is group admin
-  if (jid.endsWith('@g.us')) {
-    try {
-      const metadata = await sock.groupMetadata(jid);
-      const participant = metadata.participants.find((p: any) => p.id === senderJid);
-      return participant?.admin === 'admin' || participant?.admin === 'superadmin';
-    } catch (err) {
-      console.error('[AdminCheck] Failed to fetch group metadata:', err);
-    }
-  }
+  if (devNumbers.includes(senderNumber)) return true;
 
   return false;
 }

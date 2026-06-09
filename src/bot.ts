@@ -10,7 +10,7 @@ import dotenv from 'dotenv';
 import { getDb } from './db/mongodb';
 import { useMongoDBAuthState } from './auth/mongo-auth';
 import { queueMessage } from './queue/message-queue';
-import { storeLidPhoneMapping, captureGroupParticipantMappings } from './db/lid-phone-map';
+import { storeLidPhoneMapping, captureGroupParticipantMappings, resolvePhoneFromLid } from './db/lid-phone-map';
 import fs from 'fs';
 import path from 'path';
 
@@ -239,6 +239,117 @@ export async function startWhatsAppBot(): Promise<any> {
       } else {
         console.log('[Bot] Logged out from WhatsApp. Please delete credentials in MongoDB if you wish to re-scan.');
       }
+    }
+  });
+
+  // 2b. Welcome message and verification for new group participants
+  sock.ev.on('group-participants.update', async (update) => {
+    const { id, participants, action } = update;
+
+    // Only handle when users join/are added to the group
+    if (action === 'add') {
+      console.log(`[Bot] Participants added to group ${id}:`, participants);
+      
+      // Delay the welcome message processing by 15 seconds to allow the user to fully join the chat
+      setTimeout(async () => {
+        try {
+          const db = getDb();
+          const referralsCollection = db.collection('referrals');
+          const prefix = process.env.BOT_PREFIX || '/';
+
+          // Import sendHumanLikeResponse dynamically to avoid circular dependencies
+          const { sendHumanLikeResponse } = await import('./commands');
+
+          // Bot identification details
+          const envBotNumber = process.env.BOT_NUMBER || '';
+          const cleanEnvBotNumber = envBotNumber.replace(/\D/g, ''); // Extract only digits
+          const botJid = sock.user?.id ? cleanJid(sock.user.id) : '';
+
+          // Fetch group name dynamically (once for all participants)
+          let groupName = 'the group';
+          try {
+            const metadata = await sock.groupMetadata(id);
+            groupName = metadata.subject || 'the group';
+          } catch (err) {
+            console.error('[Bot] Failed to fetch group metadata for welcome message:', err);
+          }
+
+          // Collect unregistered participants for a single group welcome
+          const unregisteredMentions: { targetJid: string }[] = [];
+
+          for (const participant of participants) {
+            const cleanedParticipant = cleanJid(participant);
+
+            // Skip if the participant is the bot itself
+            const isBot = (botJid && cleanedParticipant === botJid) || 
+                          (cleanEnvBotNumber && cleanedParticipant.split('@')[0] === cleanEnvBotNumber);
+            if (isBot) continue;
+
+            // Resolve phone JID from LID if needed
+            let resolvedPhone: string | null = null;
+            if (cleanedParticipant.endsWith('@lid')) {
+              try {
+                resolvedPhone = await resolvePhoneFromLid(sock, cleanedParticipant);
+              } catch (err) {
+                console.error(`[Bot] Failed to resolve phone JID for participant: ${cleanedParticipant}`, err);
+              }
+            }
+
+            try {
+              // Check if they are registered in the database
+              const existing = await referralsCollection.findOne({
+                $or: [
+                  { _id: cleanedParticipant },
+                  ...(resolvedPhone ? [{ phoneJid: resolvedPhone }] : [])
+                ],
+                deletedAt: { $exists: false }
+              } as any);
+
+              if (!existing) {
+                const targetJid = resolvedPhone || cleanedParticipant;
+                unregisteredMentions.push({ targetJid });
+
+                // Humanized stagger: wait 3–7 seconds between each DM to avoid rate-limiting
+                const staggerDelay = Math.floor(Math.random() * 4000) + 3000;
+                await new Promise((resolve) => setTimeout(resolve, staggerDelay));
+
+                // Send detailed registration info via DM (guaranteed delivery)
+                const dmMessage = `🎁 *Welcome!* You just joined *${groupName}*.\n━━━━━━━━━━━━━━━━━━━━━━━━\n\nUnlocks company referrals! Register in 5 seconds to get searched by others in the group:\n👉 \`${prefix}reg-ref <companyName>\`\n\n💡 *Benefits:*\n- Unlocks search access to see others' referrals\n- Helps others connect with you for opportunities\n\n_(🎓 Students/Unemployed: register as *Student* or *Unemployed*)_`;
+
+                try {
+                  await sendHumanLikeResponse(sock, targetJid, { text: dmMessage });
+                } catch (dmErr) {
+                  console.error(`[Bot] Failed to send DM welcome to ${targetJid}:`, dmErr);
+                }
+              }
+            } catch (err) {
+              console.error(`[Bot] Failed to verify registration status for participant ${cleanedParticipant}:`, err);
+            }
+          }
+
+          // Send a short group welcome message after an extra delay (35s total from join)
+          // to allow WhatsApp cipher key exchange to complete for the new member
+          if (unregisteredMentions.length > 0) {
+            setTimeout(async () => {
+              try {
+                const mentionTags = unregisteredMentions.map(u => `@${u.targetJid.split('@')[0]}`).join(' ');
+                const mentionJids = unregisteredMentions.map(u => u.targetJid);
+
+                const groupWelcome = `🎁 *Welcome!* ${mentionTags}\n\nDon't forget to register with \`${prefix}reg-ref <companyName>\` to unlock referral access! Check your DMs for details. 💬`;
+
+                await sendHumanLikeResponse(sock, id, {
+                  text: groupWelcome,
+                  mentions: mentionJids
+                });
+              } catch (grpErr) {
+                console.error('[Bot] Failed to send group welcome message:', grpErr);
+              }
+            }, 20000); // Additional 20s delay (35s total from join)
+          }
+        } catch (err) {
+          console.error('[Bot] Failed to process delayed welcome message:', err);
+        }
+      }, 15000);
     }
   });
 

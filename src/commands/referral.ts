@@ -1,4 +1,4 @@
-import { Command, sendHumanLikeResponse, isSenderAdmin, getLevenshteinDistance } from './index';
+import { Command, sendHumanLikeResponse, isSenderDev, getLevenshteinDistance } from './index';
 import { getDb } from '../db/mongodb';
 import { batchResolvePhoneJids, captureGroupParticipantMappings, storeLidPhoneMapping } from '../db/lid-phone-map';
 import { proto } from '@whiskeysockets/baileys';
@@ -347,112 +347,11 @@ export const refListCommand: Command = {
   description: 'Lists all companies and registered users.',
   execute: async (sock, msg) => {
     const jid = msg.key.remoteJid!;
-    const referralsCollection = getDb().collection<ReferralDoc>('referrals');
-
-    // Retroactively capture the sender's phoneJid if they run -ref_list
-    const senderJid = cleanUserJid(msg.key.participant || msg.key.remoteJid!);
-    const currentPhoneJid = resolvePhoneJid(msg);
-    if (currentPhoneJid) {
-      await referralsCollection.updateOne(
-        { _id: senderJid, phoneJid: { $exists: false }, deletedAt: { $exists: false } } as any,
-        { $set: { phoneJid: currentPhoneJid } }
-      );
-      // Also store in the LID mapping if sender uses LID
-      if (senderJid.endsWith('@lid')) {
-        await storeLidPhoneMapping(senderJid, currentPhoneJid);
-      }
-    }
-
-    // If in a group, capture LID→Phone mappings from all group participants in the background
-    if (jid.endsWith('@g.us')) {
-      sock.groupMetadata(jid)
-        .then((metadata: any) => {
-          captureGroupParticipantMappings(metadata.participants).catch((err) => {
-            console.error('[RefList] Failed to process group participant mappings:', err);
-          });
-        })
-        .catch((err: any) => {
-          console.error('[RefList] Failed to fetch group metadata:', err);
-        });
-    }
-
-    const allRecords = await referralsCollection.find({ deletedAt: { $exists: false } }).toArray();
-
-    // DEBUG: Log all record data to understand what JIDs and phone JIDs are stored
-    console.log('[RefList] DEBUG - All records:');
-    for (const r of allRecords) {
-      console.log(`  _id=${r._id} | username=${r.username} | phoneJid=${r.phoneJid || 'NONE'} | company=${r.company}`);
-    }
-
-    if (allRecords.length === 0) {
-      await sendHumanLikeResponse(
-        sock,
-        jid,
-        { text: '🏢 *No registered company referrals found.*' },
-        { quoted: msg }
-      );
-      return;
-    }
-
-    // Actively resolve all LID-based user JIDs to phone JIDs by querying WhatsApp servers.
-    // This is the key step that makes DM mentions clickable.
-    const lidJids = allRecords
-      .filter((r) => r._id.endsWith('@lid') && !r.phoneJid)
-      .map((r) => r._id);
-    console.log(`[RefList] Resolving ${lidJids.length} LID(s) to phone JIDs via WhatsApp...`);
-    const lidPhoneMap = await batchResolvePhoneJids(sock, lidJids);
-
-    // Also try to resolve from stored phoneJid field on records
-    // and from the fresh LID mapping
-    const resolvePhoneForRecord = (record: ReferralDoc): string | undefined => {
-      // 1. Already has a phone JID stored on the record
-      if (record.phoneJid?.endsWith('@s.whatsapp.net')) return record.phoneJid;
-      // 2. Resolved from LID mapping service
-      if (record._id.endsWith('@lid')) return lidPhoneMap.get(record._id);
-      // 3. The _id itself is a phone JID
-      if (record._id.endsWith('@s.whatsapp.net')) return record._id;
-      return undefined;
-    };
-
-    // Group records by company
-    const grouped: { [company: string]: ReferralDoc[] } = {};
-    for (const record of allRecords) {
-      if (!grouped[record.company]) {
-        grouped[record.company] = [];
-      }
-      grouped[record.company].push(record);
-    }
-
-    let text = `🏢 *Registered Referral Directory*\n`;
-    text += `━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
-    const allMentions: string[] = [];
-
-    // Sort company names alphabetically
-    const sortedCompanies = Object.keys(grouped).sort((a, b) => a.localeCompare(b));
-
-    for (const company of sortedCompanies) {
-      const count = grouped[company].length;
-      text += `🏢 *${company}* (${count} ${count === 1 ? 'user' : 'users'})\n`;
-      for (const record of grouped[company]) {
-        const resolvedPhone = resolvePhoneForRecord(record);
-        const formatted = formatUser(record._id, record.username, jid, record.phoneJid, resolvedPhone);
-        text += `  └ 👤 ${formatted.text}\n`;
-        if (formatted.mentions.length > 0) {
-          allMentions.push(...formatted.mentions);
-        }
-      }
-      text += `\n`;
-    }
-
-    text += `━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-    text += `📊 *Summary:* ${sortedCompanies.length} Companies | ${allRecords.length} Users`;
-
     await sendHumanLikeResponse(
       sock,
       jid,
       {
-        text: text.trim(),
-        mentions: allMentions,
+        text: `🚫 *Command Disabled*\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ The \`${prefix}reflist\` command is temporarily disabled.\n\n💡 Please register using \`${prefix}reg-ref <companyName>\` first, then use \`${prefix}company\` to check company data.`
       },
       { quoted: msg }
     );
@@ -465,11 +364,33 @@ export const refListCommand: Command = {
  */
 export const companyCommand: Command = {
   name: 'company',
-  aliases: ['companies'],
+  aliases: ['companies', 'campnay', 'compney', 'compnay'],
   description: 'Lists registered companies or gets users under a specific company.',
   execute: async (sock, msg, args) => {
     const jid = msg.key.remoteJid!;
+    const senderJid = cleanUserJid(msg.key.participant || msg.key.remoteJid!);
     const referralsCollection = getDb().collection<ReferralDoc>('referrals');
+
+    // Authentication: Check if the user is registered first
+    const existing = await referralsCollection.findOne({
+      $or: [
+        { _id: senderJid },
+        ...((msg.key.participant || msg.key.remoteJid!).endsWith('@lid') && resolvePhoneJid(msg) ? [{ phoneJid: resolvePhoneJid(msg) }] : [])
+      ],
+      deletedAt: { $exists: false }
+    } as any);
+
+    if (!existing) {
+      await sendHumanLikeResponse(
+        sock,
+        jid,
+        {
+          text: `🤖 *BlenderRevive Bot Policy*\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ *Registration Required*\n\nAs per the bot policy, you must register yourself first before accessing company data.\n\n👉 Please register using the command:\n\`${prefix}reg-ref <companyName>\`\n\n📝 *Important Notes:*\n- If you register under a false company, the developer or administrators might ban you.\n- If you are a student or unemployed, please register yourself as *Student* or *Unemployed* (e.g. \`${prefix}reg-ref Student\` or \`${prefix}reg-ref Unemployed\`).\n\nThank you for your cooperation! 🙏`
+        },
+        { quoted: msg }
+      );
+      return;
+    }
 
     // Case 1: No arguments - show list of all companies
     if (args.length === 0) {
@@ -585,16 +506,16 @@ export const companyCommand: Command = {
  */
 export const refUpdateCommand: Command = {
   name: 'ref_update',
-  description: 'Admin: Updates a company name globally.',
+  description: 'Dev: Updates a company name globally.',
   execute: async (sock, msg, args) => {
     const jid = msg.key.remoteJid!;
 
-    // Validate admin rights
-    if (!(await isSenderAdmin(sock, msg))) {
+    // Validate dev rights
+    if (!(await isSenderDev(sock, msg))) {
       await sendHumanLikeResponse(
         sock,
         jid,
-        { text: '❌ *Access Denied:* Only administrators can manage company records.' },
+        { text: '❌ *Access Denied:* Only developers can manage company records.' },
         { quoted: msg }
       );
       return;
@@ -655,16 +576,16 @@ export const refUpdateCommand: Command = {
  */
 export const refDeleteCommand: Command = {
   name: 'ref_delete',
-  description: 'Admin: Deletes a company and all user registrations under it.',
+  description: 'Dev: Deletes a company and all user registrations under it.',
   execute: async (sock, msg, args) => {
     const jid = msg.key.remoteJid!;
 
-    // Validate admin rights
-    if (!(await isSenderAdmin(sock, msg))) {
+    // Validate dev rights
+    if (!(await isSenderDev(sock, msg))) {
       await sendHumanLikeResponse(
         sock,
         jid,
-        { text: '❌ *Access Denied:* Only administrators can manage company records.' },
+        { text: '❌ *Access Denied:* Only developers can manage company records.' },
         { quoted: msg }
       );
       return;
@@ -722,7 +643,7 @@ export const refDeleteCommand: Command = {
 export const tagunregCommand: Command = {
   name: 'tagunreg',
   aliases: ['tagunregistered', 'tagallunregistered'],
-  description: 'Admin: Mentions all group members who have not registered in the referral system.',
+  description: 'Dev: Mentions all group members who have not registered in the referral system.',
   execute: async (sock, msg) => {
     const jid = msg.key.remoteJid!;
 
@@ -737,12 +658,12 @@ export const tagunregCommand: Command = {
       return;
     }
 
-    // 2. Validate admin rights
-    if (!(await isSenderAdmin(sock, msg))) {
+    // 2. Validate dev rights
+    if (!(await isSenderDev(sock, msg))) {
       await sendHumanLikeResponse(
         sock,
         jid,
-        { text: '❌ *Access Denied:* Only administrators can tag unregistered group members.' },
+        { text: '❌ *Access Denied:* Only developers can tag unregistered group members.' },
         { quoted: msg }
       );
       return;
