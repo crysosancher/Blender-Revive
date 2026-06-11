@@ -1,6 +1,6 @@
 import { Command, sendHumanLikeResponse, isSenderDev, isSenderGroupAdmin } from './index';
 import { getDb } from '../db/mongodb';
-import { batchResolvePhoneJids, captureGroupParticipantMappings, storeLidPhoneMapping } from '../db/lid-phone-map';
+import { batchResolvePhoneJids, storeLidPhoneMapping } from '../db/lid-phone-map';
 import { proto } from '@whiskeysockets/baileys';
 import { verifyAndNormalizeCompany, runDatabaseCompanyNormalization, flushStaleVerifications, CompanyVerificationDoc } from '../services/company-verifier';
 import { resolveCompanySanity, sanitizeCompanyName, escapeRegex } from '../services/company-resolver';
@@ -89,6 +89,63 @@ function formatUser(
     }
     const lidNum = targetJid.split('@')[0];
     return { text: `@${lidNum}`, mentions: [targetJid] };
+  }
+}
+
+/**
+ * Ensures the message sender is a registered user. Sends a registration-required prompt
+ * and returns null if they are not. Returns the existing referral record on success.
+ *
+ * This is the shared auth gate for any command that surfaces data about other users
+ * (e.g. /company, /search).
+ */
+async function requireRegisteredUser(
+  sock: any,
+  msg: proto.IWebMessageInfo
+): Promise<ReferralDoc | null> {
+  const jid = msg.key.remoteJid!;
+  const senderJid = cleanUserJid(msg.key.participant || msg.key.remoteJid!);
+  const phoneJid = resolvePhoneJid(msg) || undefined;
+
+  const referralsCollection = getDb().collection<ReferralDoc>('referrals');
+
+  const existing = await referralsCollection.findOne({
+    $or: [
+      { _id: senderJid },
+      ...(phoneJid ? [{ phoneJid }] : []),
+    ],
+    deletedAt: { $exists: false }
+  } as any);
+
+  if (!existing) {
+    await sendHumanLikeResponse(
+      sock,
+      jid,
+      {
+        text: `🤖 *BlenderRevive Bot Policy*\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ *Registration Required*\n\nAs per the bot policy, you must register yourself first before accessing user data.\n\n👉 Please register using the command:\n\`${prefix}reg-ref <companyName>\`\n\n📝 *Important Notes:*\n- If you register under a false company, the developer or administrators might ban you.\n- If you are a student or unemployed, please register yourself as *Student* or *Unemployed* (e.g. \`${prefix}reg-ref Student\` or \`${prefix}reg-ref Unemployed\`).\n\nThank you for your cooperation! 🙏`
+      },
+      { quoted: msg }
+    );
+    return null;
+  }
+
+  return existing;
+}
+
+/**
+ * Formats a registration date as a human-readable string in the en-IN locale.
+ * Returns "Unknown" if the date is missing or invalid.
+ */
+function formatRegDate(date: Date | string | undefined): string {
+  if (!date) return 'Unknown';
+  try {
+    return new Date(date).toLocaleDateString('en-IN', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+    });
+  } catch {
+    return 'Unknown';
   }
 }
 
@@ -377,29 +434,10 @@ export const companyCommand: Command = {
   description: 'Lists registered companies or gets users under a specific company.',
   execute: async (sock, msg, args) => {
     const jid = msg.key.remoteJid!;
-    const senderJid = cleanUserJid(msg.key.participant || msg.key.remoteJid!);
     const referralsCollection = getDb().collection<ReferralDoc>('referrals');
 
-    // Authentication: Check if the user is registered first
-    const existing = await referralsCollection.findOne({
-      $or: [
-        { _id: senderJid },
-        ...((msg.key.participant || msg.key.remoteJid!).endsWith('@lid') && resolvePhoneJid(msg) ? [{ phoneJid: resolvePhoneJid(msg) }] : [])
-      ],
-      deletedAt: { $exists: false }
-    } as any);
-
-    if (!existing) {
-      await sendHumanLikeResponse(
-        sock,
-        jid,
-        {
-          text: `🤖 *BlenderRevive Bot Policy*\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n⚠️ *Registration Required*\n\nAs per the bot policy, you must register yourself first before accessing company data.\n\n👉 Please register using the command:\n\`${prefix}reg-ref <companyName>\`\n\n📝 *Important Notes:*\n- If you register under a false company, the developer or administrators might ban you.\n- If you are a student or unemployed, please register yourself as *Student* or *Unemployed* (e.g. \`${prefix}reg-ref Student\` or \`${prefix}reg-ref Unemployed\`).\n\nThank you for your cooperation! 🙏`
-        },
-        { quoted: msg }
-      );
-      return;
-    }
+    // Authentication: sender must be registered
+    if (!(await requireRegisteredUser(sock, msg))) return;
 
     // Fetch cached company verifications
     const verificationsCol = getDb().collection<CompanyVerificationDoc>('company_verifications');
@@ -1065,5 +1103,243 @@ export const tagCompanyCommand: Command = {
       { quoted: msg }
     );
   }
+};
+
+/**
+ * Command: -search <@user | @phone | name>
+ * Looks up users by three modes:
+ *   1. `@mention` (e.g. `/search @BHUMIK JAIN`) — WhatsApp converts the @ to a LID
+ *      mention, which we resolve via the `mentionedJid` list in message context.
+ *   2. Phone number (e.g. `/search @7070224546` or `/search +91 7070224546`) — suffix
+ *      match against `_id` / `phoneJid` fields.
+ *   3. Name substring (e.g. `/search Bhumik`) — case-insensitive regex on `username`.
+ */
+export const searchCommand: Command = {
+  name: 'search',
+  aliases: ['find', 'lookup', 'whois', 'userinfo'],
+  description: 'Look up users by @mention, phone tag, or name. /search @user, /search @7070224546, or /search Bhumik.',
+  execute: async (sock, msg, args) => {
+    const jid = msg.key.remoteJid!;
+
+    // 1. Auth gate — must be registered to look up others (prevents scraping)
+    if (!(await requireRegisteredUser(sock, msg))) return;
+
+    const referralsCollection = getDb().collection<ReferralDoc>('referrals');
+    const verificationsCol = getDb().collection<CompanyVerificationDoc>('company_verifications');
+
+    // Build a verifications cache for badge/display lookups
+    const verifications = await verificationsCol.find({}).toArray();
+    const verificationsMap = new Map<string, CompanyVerificationDoc>();
+    for (const v of verifications) {
+      verificationsMap.set(v._id, v);
+      if (v.canonicalName) {
+        verificationsMap.set(v.canonicalName.toUpperCase().replace(/[\s_]+/g, '_'), v);
+      }
+    }
+
+    // Build a company-member-count map in one aggregation so the card can show
+    // "— N users" next to the company name.
+    const companyCountRows = await referralsCollection.aggregate([
+      { $match: { deletedAt: { $exists: false } } },
+      { $group: { _id: '$company', count: { $sum: 1 } } }
+    ] as any).toArray() as Array<{ _id: string; count: number }>;
+    const companyCountMap = new Map<string, number>(
+      companyCountRows.map((c) => [c._id, c.count])
+    );
+
+    /**
+     * Render a single user card.
+     */
+    const renderCard = (user: ReferralDoc): string => {
+      const lookupKey = user.company.toUpperCase().replace(/[\s_]+/g, '_');
+      const cache = verificationsMap.get(lookupKey);
+      const companyDisplay = cache ? cache.displayName : user.company.replace(/_/g, ' ');
+      const badge = cache
+        ? (cache.rank === 'A' ? '⭐ ' : (cache.rank === 'B' ? '✅ ' : '❓ '))
+        : '❓ ';
+      const rankText = cache && cache.rank !== 'unranked' ? ` (Rank ${cache.rank})` : '';
+
+      // Member count for this company
+      const memberCount = companyCountMap.get(user.company) || 1;
+      const memberText = ` — ${memberCount} ${memberCount === 1 ? 'user' : 'users'}`;
+
+      const idPart = user._id.split('@')[0];
+      const username = user.username && user.username !== 'Unknown'
+        ? user.username
+        : `User ${idPart.slice(-4)}`;
+
+      let card = `👤 *User Card*\n`;
+      card += `━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+      card += `🏢 *Company:* ${badge}${companyDisplay}${rankText}${memberText}\n`;
+      if (cache?.justification) {
+        card += `ℹ️ _${cache.justification}_\n`;
+      }
+      card += `📛 *Name:* ${username}\n`;
+      card += `📅 *Registered:* ${formatRegDate(user.createdAt)}\n`;
+      if (user.updatedAt && user.createdAt && user.updatedAt.getTime() !== user.createdAt.getTime()) {
+        card += `🔄 *Last Updated:* ${formatRegDate(user.updatedAt)}\n`;
+      }
+      return card;
+    };
+
+    // ─── Strategy 1: @mention lookup (LID-based) ───
+    // When the user types `/search @BHUMIK JAIN`, WhatsApp converts `@BHUMIK JAIN`
+    // to a mention tag carrying the user's LID. The mention shows up in the
+    // `extendedTextMessage.contextInfo.mentionedJid` array — we look those up
+    // directly against the referrals `_id` / `phoneJid` fields.
+    const ctxInfo: any = (msg.message as any)?.extendedTextMessage?.contextInfo
+      || (msg.message as any)?.imageMessage?.contextInfo
+      || (msg.message as any)?.videoMessage?.contextInfo
+      || null;
+    const mentionedJids: string[] = ctxInfo?.mentionedJid || [];
+
+    if (mentionedJids.length > 0) {
+      const found: ReferralDoc[] = [];
+      const notFound: string[] = [];
+
+      for (const mJid of mentionedJids) {
+        const cleanJid = cleanUserJid(mJid);
+        const user = await referralsCollection.findOne({
+          $or: [
+            { _id: cleanJid },
+            { phoneJid: cleanJid }
+          ],
+          deletedAt: { $exists: false }
+        } as any);
+        if (user) {
+          found.push(user);
+        } else {
+          notFound.push(cleanJid);
+        }
+      }
+
+      if (found.length === 0) {
+        const notFoundTags = notFound.map((j) => `@${j.split('@')[0]}`).join(', ');
+        await sendHumanLikeResponse(
+          sock,
+          jid,
+          {
+            text: `❌ *No registered user found for:* ${notFoundTags}\n\n_Make sure they've registered with \`${prefix}reg_ref <company>\`._`
+          },
+          { quoted: msg }
+        );
+        return;
+      }
+
+      let text = '';
+      for (let i = 0; i < found.length; i++) {
+        if (i > 0) text += `\n\n`;
+        text += renderCard(found[i]);
+      }
+      if (notFound.length > 0) {
+        text += `\n\n⚠️ _Also mentioned but not registered:_ ${notFound.map((j) => `@${j.split('@')[0]}`).join(', ')}`;
+      }
+
+      await sendHumanLikeResponse(
+        sock,
+        jid,
+        { text: text.trim() },
+        { quoted: msg }
+      );
+      return;
+    }
+
+    // ─── Strategy 2: phone-number lookup ───
+    const rawTag = args.join(' ').trim().replace(/^@/, '');
+    const digits = rawTag.replace(/\D/g, '');
+    const isDigitsOnly = digits.length > 0 && rawTag.replace(/[\D@]/g, '') === digits;
+
+    if (digits.length >= 5 && digits.length <= 15) {
+      const escapedDigits = escapeRegex(digits);
+      const phoneSuffixRegex = new RegExp(`${escapedDigits}@s\\.whatsapp\\.net$`);
+
+      const user = await referralsCollection.findOne({
+        $or: [
+          { _id: phoneSuffixRegex },
+          { phoneJid: phoneSuffixRegex }
+        ],
+        deletedAt: { $exists: false }
+      } as any);
+
+      if (user) {
+        await sendHumanLikeResponse(
+          sock,
+          jid,
+          { text: renderCard(user) },
+          { quoted: msg }
+        );
+        return;
+      }
+
+      // If the input was clearly a phone attempt (only digits and @/+), show a
+      // phone-specific error and stop. Don't fall through to name search.
+      if (isDigitsOnly) {
+        await sendHumanLikeResponse(
+          sock,
+          jid,
+          {
+            text: `❌ *No registered user found for:* @${digits}\n\n_Make sure they've registered with \`${prefix}reg_ref <company>\`._`
+          },
+          { quoted: msg }
+        );
+        return;
+      }
+    }
+
+    // ─── Strategy 3: name search (substring on `username`) ───
+    if (rawTag && rawTag.length >= 2 && /[a-zA-Z]/.test(rawTag)) {
+      const nameRegex = new RegExp(escapeRegex(rawTag), 'i');
+      const matches = await referralsCollection.find({
+        username: nameRegex,
+        deletedAt: { $exists: false }
+      }).limit(10).toArray();
+
+      if (matches.length === 1) {
+        await sendHumanLikeResponse(
+          sock,
+          jid,
+          { text: renderCard(matches[0]) },
+          { quoted: msg }
+        );
+        return;
+      }
+
+      if (matches.length > 1) {
+        let text = `🔍 *Found ${matches.length} users matching "${rawTag}":*\n`;
+        text += `━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+        for (const user of matches) {
+          const lookupKey = user.company.toUpperCase().replace(/[\s_]+/g, '_');
+          const cache = verificationsMap.get(lookupKey);
+          const companyDisplay = cache ? cache.displayName : user.company.replace(/_/g, ' ');
+          const badge = cache
+            ? (cache.rank === 'A' ? '⭐ ' : (cache.rank === 'B' ? '✅ ' : '❓ '))
+            : '❓ ';
+          const rankText = cache && cache.rank !== 'unranked' ? ` (Rank ${cache.rank})` : '';
+          const memberCount = companyCountMap.get(user.company) || 1;
+          const memberText = ` — ${memberCount} ${memberCount === 1 ? 'user' : 'users'}`;
+          text += `👤 *${user.username}* — ${badge}${companyDisplay}${rankText}${memberText}\n\n`;
+        }
+        text += `💡 _Tip: Use \`${prefix}search @<user>\` to see a specific user's full card._`;
+
+        await sendHumanLikeResponse(
+          sock,
+          jid,
+          { text: text.trim() },
+          { quoted: msg }
+        );
+        return;
+      }
+    }
+
+    // Nothing matched — show usage
+    await sendHumanLikeResponse(
+      sock,
+      jid,
+      {
+        text: `⚠️ *No matching user found for:* _${rawTag || '(empty)'}_\n\n*Usage:*\n- \`${prefix}search @<user>\` — mention a user\n- \`${prefix}search @7070224546\` — phone number\n- \`${prefix}search Bhumik\` — name (partial match)`
+      },
+      { quoted: msg }
+    );
+  },
 };
 

@@ -337,7 +337,8 @@ import {
   tagunregCommand,
   companyCommand,
   verifyCronCommand,
-  tagCompanyCommand
+  tagCompanyCommand,
+  searchCommand
 } from './referral';
 import { devCommand } from './dev';
 
@@ -352,5 +353,6 @@ registerCommand(tagunregCommand);
 registerCommand(companyCommand);
 registerCommand(verifyCronCommand);
 registerCommand(tagCompanyCommand);
+registerCommand(searchCommand);
 registerCommand(devCommand);
 

@@ -27,7 +27,7 @@ export const helpCommand: Command = {
 
     // Classify
     for (const cmd of commands) {
-      if (['company', 'reg_ref', 'update_ref', 'ref_list'].includes(cmd.name)) {
+      if (['company', 'search', 'reg_ref', 'update_ref', 'ref_list'].includes(cmd.name)) {
         categories.user.push(cmd);
       } else if (['ref_update', 'ref_delete', 'tagunreg', 'tag_company', 'verify_cron'].includes(cmd.name)) {
         categories.admin.push(cmd);
@@ -36,8 +36,8 @@ export const helpCommand: Command = {
       }
     }
 
-    // Sort user category according to specified order: company, reg_ref, update_ref, ref_list
-    const userOrder = ['company', 'reg_ref', 'update_ref', 'ref_list'];
+    // Sort user category according to specified order: company, search, reg_ref, update_ref, ref_list
+    const userOrder = ['company', 'search', 'reg_ref', 'update_ref', 'ref_list'];
     categories.user.sort((a, b) => userOrder.indexOf(a.name) - userOrder.indexOf(b.name));
 
     // Sort admin category: ref_update, ref_delete, tagunreg, tag_company, verify_cron
