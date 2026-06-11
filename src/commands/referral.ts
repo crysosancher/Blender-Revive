@@ -1,8 +1,9 @@
-import { Command, sendHumanLikeResponse, isSenderDev, getLevenshteinDistance } from './index';
+import { Command, sendHumanLikeResponse, isSenderDev, isSenderGroupAdmin } from './index';
 import { getDb } from '../db/mongodb';
 import { batchResolvePhoneJids, captureGroupParticipantMappings, storeLidPhoneMapping } from '../db/lid-phone-map';
 import { proto } from '@whiskeysockets/baileys';
 import { verifyAndNormalizeCompany, runDatabaseCompanyNormalization, flushStaleVerifications, CompanyVerificationDoc } from '../services/company-verifier';
+import { resolveCompanySanity, sanitizeCompanyName, escapeRegex } from '../services/company-resolver';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -28,96 +29,6 @@ function cleanUserJid(jid: string): string {
   const user = parts[0].split(':')[0];
   const domain = parts[1] || 's.whatsapp.net';
   return `${user}@${domain}`;
-}
-
-/**
- * Sanitizes a company name by capitalizing the first letter of each word and replacing spaces with underscores.
- */
-function sanitizeCompanyName(name: string): string {
-  if (!name) return '';
-  return name
-    .trim()
-    .split(/[_\s]+/) // Split by spaces or underscores
-    .filter(Boolean)
-    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-    .join('_');
-}
-
-/**
- * Escapes special regex characters in a string.
- */
-function escapeRegex(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-/**
- * Resolves a company name by checking for exact matches, substring matches, or close typos in the database.
- * If a match is found, returns the matched company name and a boolean indicating if it was a suggestion.
- * If no match is found, returns the sanitized input.
- */
-async function resolveCompanySanity(rawName: string): Promise<{ matched: string; isSuggested: boolean }> {
-  const sanitized = sanitizeCompanyName(rawName);
-  if (!sanitized) return { matched: '', isSuggested: false };
-
-  const referralsCollection = getDb().collection<ReferralDoc>('referrals');
-
-  // 1. Check exact/case-insensitive match (not soft-deleted)
-  const exactMatch = await referralsCollection.findOne({
-    company: { $regex: new RegExp(`^${escapeRegex(sanitized)}$`, 'i') },
-    deletedAt: { $exists: false }
-  } as any);
-
-  if (exactMatch) {
-    return { matched: exactMatch.company, isSuggested: false };
-  }
-
-  // Get all unique companies (not soft-deleted)
-  const allCompanies = await referralsCollection.distinct('company', { deletedAt: { $exists: false } });
-  if (allCompanies.length === 0) {
-    return { matched: sanitized, isSuggested: false };
-  }
-
-  // 2. Try substring matching
-  const substringMatches = allCompanies.filter((c) =>
-    c.toLowerCase().includes(sanitized.toLowerCase())
-  );
-
-  if (substringMatches.length > 0) {
-    substringMatches.sort((a, b) => {
-      const aStarts = a.toLowerCase().startsWith(sanitized.toLowerCase());
-      const bStarts = b.toLowerCase().startsWith(sanitized.toLowerCase());
-      if (aStarts && !bStarts) return -1;
-      if (!aStarts && bStarts) return 1;
-      return a.length - b.length;
-    });
-    return { matched: substringMatches[0], isSuggested: true };
-  }
-
-  // 3. Try Levenshtein fuzzy matching
-  let closestMatch: string | null = null;
-  let minDistance = Infinity;
-
-  for (const company of allCompanies) {
-    const dist = getLevenshteinDistance(sanitized.toLowerCase(), company.toLowerCase());
-    if (dist < minDistance) {
-      minDistance = dist;
-      closestMatch = company;
-    }
-  }
-
-  let threshold = 3;
-  if (sanitized.length <= 3) {
-    threshold = 1;
-  } else if (sanitized.length <= 6) {
-    threshold = 2;
-  }
-
-  if (closestMatch && minDistance <= threshold) {
-    return { matched: closestMatch, isSuggested: true };
-  }
-
-  // No match found - treat as a brand new company name
-  return { matched: sanitized, isSuggested: false };
 }
 
 
@@ -576,7 +487,11 @@ export const companyCommand: Command = {
         text += `\n`;
       }
 
+      const totalCompanies = rankA.length + rankB.length + unranked.length;
+      const totalUsers = allRecords.length;
+
       text += `━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+      text += `📊 *Total:* ${totalCompanies} ${totalCompanies === 1 ? 'company' : 'companies'} • ${totalUsers} ${totalUsers === 1 ? 'user' : 'users'} registered\n\n`;
       text += `💡 _Tip: Use \`${prefix}company <company_name>\` to view users registered under that company._`;
 
       await sendHumanLikeResponse(
@@ -591,17 +506,24 @@ export const companyCommand: Command = {
     // Case 2: Company name is provided - find registrations under it
     const rawTargetCompany = args.join(' ').trim();
 
-    // Call verifyAndNormalizeCompany to check ranking and canonical name
-    const verification = await verifyAndNormalizeCompany(rawTargetCompany);
-    const matchedCompany = verification.canonicalName;
+    // First, try to find an existing company in the DB using substring/fuzzy matching.
+    // This handles partial inputs like "bdo" -> "BDO_India", "infosys lim" -> "Infosys_Limited", etc.
+    const sanityMatch = await resolveCompanySanity(rawTargetCompany);
+    const matchedCompany = sanityMatch.matched;
+
+    // Run the matched company through the verifier to get rank, display name, and justification.
+    // Falls back to the raw input if the matched name is empty.
+    const verification = await verifyAndNormalizeCompany(matchedCompany || rawTargetCompany);
     const displayCompanyName = verification.displayName;
     const badge = verification.rank === 'A' ? '⭐ ' : (verification.rank === 'B' ? '✅ ' : '❓ ');
 
-    // Robust matching for database query
+    // Robust matching for database query — match canonical, space-form, AND underscore-form of the input
+    const spaceForm = matchedCompany.replace(/_/g, ' ');
     const records = await referralsCollection.find({
       $or: [
         { company: matchedCompany },
-        { company: { $regex: new RegExp(`^${escapeRegex(matchedCompany.replace(/_/g, ' '))}$`, 'i') } },
+        { company: { $regex: new RegExp(`^${escapeRegex(spaceForm)}$`, 'i') } },
+        { company: { $regex: new RegExp(`^${escapeRegex(matchedCompany)}$`, 'i') } },
         { company: { $regex: new RegExp(`^${escapeRegex(rawTargetCompany)}$`, 'i') } }
       ],
       deletedAt: { $exists: false }
@@ -621,7 +543,7 @@ export const companyCommand: Command = {
     const lidJids = records
       .filter((r) => r._id.endsWith('@lid') && !r.phoneJid)
       .map((r) => r._id);
-    
+
     let lidPhoneMap = new Map<string, string>();
     if (lidJids.length > 0) {
       lidPhoneMap = await batchResolvePhoneJids(sock, lidJids);
@@ -635,7 +557,10 @@ export const companyCommand: Command = {
     };
 
     let text = `🏢 *Referrals for ${badge}${displayCompanyName}*\n`;
-    if (verification.justification) {
+    if (sanityMatch.isSuggested) {
+      text += `💡 _Showing closest match for "${rawTargetCompany}": ${matchedCompany}_\n`;
+    }
+    if (verification.justification && !sanityMatch.isSuggested) {
       text += `💡 _${verification.justification}_\n`;
     }
     text += `━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
@@ -965,6 +890,180 @@ export const verifyCronCommand: Command = {
         { quoted: msg }
       );
     }
+  }
+};
+
+/**
+ * Command: -tag_company <Company Name>
+ * Admin Command: Tags all group members who are registered under the specified company.
+ * Authorisation: Group admins (admin / superadmin) OR the developer.
+ */
+export const tagCompanyCommand: Command = {
+  name: 'tag_company',
+  aliases: ['tagcompany', 'tagco'],
+  description: 'Admin/Group-admin: Mentions all group members registered under the given company.',
+  execute: async (sock, msg, args) => {
+    const jid = msg.key.remoteJid!;
+
+    // 1. Group-only
+    if (!jid.endsWith('@g.us')) {
+      await sendHumanLikeResponse(
+        sock,
+        jid,
+        { text: '❌ *Error:* This command can only be executed within a group chat.' },
+        { quoted: msg }
+      );
+      return;
+    }
+
+    // 2. Authorisation: developer OR group admin
+    const isDev = await isSenderDev(sock, msg);
+    const isAdmin = !isDev ? await isSenderGroupAdmin(sock, msg) : false;
+    if (!isDev && !isAdmin) {
+      await sendHumanLikeResponse(
+        sock,
+        jid,
+        { text: '❌ *Access Denied:* Only group admins (or the developer) can tag company members.' },
+        { quoted: msg }
+      );
+      return;
+    }
+
+    // 3. Parse company name
+    const rawTargetCompany = args.join(' ').trim();
+    if (!rawTargetCompany) {
+      await sendHumanLikeResponse(
+        sock,
+        jid,
+        { text: `⚠️ *Usage Error:* Use \`${prefix}tag_company <Company Name>\`` },
+        { quoted: msg }
+      );
+      return;
+    }
+
+    // 4. Resolve the company via substring/fuzzy match against existing DB companies
+    const sanityMatch = await resolveCompanySanity(rawTargetCompany);
+    const matchedCompany = sanityMatch.matched;
+
+    const referralsCollection = getDb().collection<ReferralDoc>('referrals');
+
+    // 5. Fetch all registrations under the matched company (and the raw input as a fallback)
+    const spaceForm = matchedCompany.replace(/_/g, ' ');
+    const allRegistered = await referralsCollection.find({
+      $or: [
+        { company: matchedCompany },
+        { company: { $regex: new RegExp(`^${escapeRegex(spaceForm)}$`, 'i') } },
+        { company: { $regex: new RegExp(`^${escapeRegex(matchedCompany)}$`, 'i') } },
+        { company: { $regex: new RegExp(`^${escapeRegex(rawTargetCompany)}$`, 'i') } }
+      ],
+      deletedAt: { $exists: false }
+    } as any).toArray();
+
+    if (allRegistered.length === 0) {
+      await sendHumanLikeResponse(
+        sock,
+        jid,
+        { text: `❌ *No registered users found for company:* *${matchedCompany.replace(/_/g, ' ')}*` },
+        { quoted: msg }
+      );
+      return;
+    }
+
+    // 6. Fetch group participants and intersect with the registered set
+    let metadata;
+    try {
+      metadata = await sock.groupMetadata(jid);
+    } catch (err) {
+      console.error('[TagCompany] Failed to fetch group metadata:', err);
+      await sendHumanLikeResponse(
+        sock,
+        jid,
+        { text: '❌ *Error:* Failed to retrieve group participant details.' },
+        { quoted: msg }
+      );
+      return;
+    }
+
+    // Build a JID lookup so we can match referrals against group participants using either
+    // their primary JID (which may be a LID) or their phone JID.
+    const participantJids = new Set<string>();
+    const participantMap = new Map<string, any>();
+    for (const p of metadata.participants as any[]) {
+      const cleanP = cleanUserJid(p.id);
+      participantJids.add(cleanP);
+      participantMap.set(cleanP, p);
+      if (p.phoneNumber) {
+        // Some Baileys versions expose phoneNumber on the participant object directly
+        const phoneJid = `${p.phoneNumber.split('@')[0].split(':')[0]}@s.whatsapp.net`;
+        participantJids.add(phoneJid);
+        participantMap.set(phoneJid, p);
+      }
+    }
+
+    // Filter to only the users that exist in this group (using either _id or phoneJid)
+    const inGroup = allRegistered.filter((r) => {
+      const cleanId = cleanUserJid(r._id);
+      if (participantJids.has(cleanId)) return true;
+      if (r.phoneJid && participantJids.has(cleanUserJid(r.phoneJid))) return true;
+      return false;
+    });
+
+    if (inGroup.length === 0) {
+      await sendHumanLikeResponse(
+        sock,
+        jid,
+        { text: `ℹ️ No members from *${matchedCompany.replace(/_/g, ' ')}* are currently in this group.` },
+        { quoted: msg }
+      );
+      return;
+    }
+
+    // 7. Resolve LID → phone JIDs for the in-group members (so mentions are clickable)
+    const lidJids = inGroup
+      .filter((r) => r._id.endsWith('@lid') && !r.phoneJid)
+      .map((r) => r._id);
+
+    let lidPhoneMap = new Map<string, string>();
+    if (lidJids.length > 0) {
+      lidPhoneMap = await batchResolvePhoneJids(sock, lidJids);
+    }
+
+    // 8. Get display name + best JID for each member, preferring phone JIDs (which are
+    // guaranteed to be in this group) over the raw _id (which may be a LID not in the
+    // participant map).
+    const members: { name: string; jid: string }[] = [];
+    for (const record of inGroup) {
+      const phoneJid = record.phoneJid?.endsWith('@s.whatsapp.net')
+        ? record.phoneJid
+        : (record._id.endsWith('@lid') ? lidPhoneMap.get(record._id) : undefined);
+      const targetJid = phoneJid || cleanUserJid(record._id);
+      // Use the participant's existing JID if we can find a match, otherwise the targetJid
+      const matchedParticipant = participantMap.get(targetJid) || participantMap.get(cleanUserJid(record._id));
+      const finalJid = matchedParticipant ? cleanUserJid(matchedParticipant.id) : targetJid;
+
+      members.push({
+        name: record.username && record.username !== 'Unknown' ? record.username : finalJid.split('@')[0],
+        jid: finalJid,
+      });
+    }
+
+    // 9. Compose the tag message
+    let text = `🏢 *${matchedCompany.replace(/_/g, ' ')}* — ${members.length} ${members.length === 1 ? 'member' : 'members'} in this group:\n\n`;
+    if (sanityMatch.isSuggested) {
+      text += `💡 _Showing closest match for "${rawTargetCompany}": ${matchedCompany}_\n\n`;
+    }
+    const mentions: string[] = [];
+    for (const m of members) {
+      text += `👤 @${m.jid.split('@')[0]}\n`;
+      mentions.push(m.jid);
+    }
+
+    await sendHumanLikeResponse(
+      sock,
+      jid,
+      { text: text.trim(), mentions },
+      { quoted: msg }
+    );
   }
 };
 

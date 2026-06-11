@@ -168,9 +168,41 @@ export async function isSenderDev(sock: any, msg: proto.IWebMessageInfo): Promis
 }
 
 /**
- * Core command dispatcher. Parses the message body, matches it to a registered command,
- * and executes the command asynchronously.
+ * Checks if the sender of a message is a group admin (or super-admin) in the current group.
+ * Returns false for DMs and if metadata cannot be retrieved.
  */
+export async function isSenderGroupAdmin(sock: any, msg: proto.IWebMessageInfo): Promise<boolean> {
+  const jid = msg.key.remoteJid!;
+  if (!jid.endsWith('@g.us')) return false;
+
+  const senderJid = msg.key.participant || msg.key.remoteJid!;
+
+  let metadata;
+  try {
+    metadata = await sock.groupMetadata(jid);
+  } catch (err) {
+    console.error('[isGroupAdmin] Failed to fetch group metadata:', err);
+    return false;
+  }
+
+  const senderParticipant = metadata.participants.find(
+    (p: any) => cleanUserJidLocal(p.id) === cleanUserJidLocal(senderJid)
+  );
+
+  if (!senderParticipant) return false;
+  return senderParticipant.admin === 'admin' || senderParticipant.admin === 'superadmin';
+}
+
+/**
+ * Local JID cleaner used by isSenderGroupAdmin. Mirrors the helper in referral.ts.
+ */
+function cleanUserJidLocal(jid: string): string {
+  const parts = jid.split('@');
+  const user = parts[0].split(':')[0];
+  const domain = parts[1] || 's.whatsapp.net';
+  return `${user}@${domain}`;
+}
+
 /**
  * Computes the Levenshtein distance between two strings.
  */
@@ -296,15 +328,16 @@ export async function handleIncomingMessage(sock: any, msg: proto.IWebMessageInf
 // Import and register all commands
 import { pingCommand } from './ping';
 import { helpCommand } from './help';
-import { 
-  regRefCommand, 
-  updateRefCommand, 
-  refListCommand, 
-  refUpdateCommand, 
+import {
+  regRefCommand,
+  updateRefCommand,
+  refListCommand,
+  refUpdateCommand,
   refDeleteCommand,
   tagunregCommand,
   companyCommand,
-  verifyCronCommand
+  verifyCronCommand,
+  tagCompanyCommand
 } from './referral';
 import { devCommand } from './dev';
 
@@ -318,5 +351,6 @@ registerCommand(refDeleteCommand);
 registerCommand(tagunregCommand);
 registerCommand(companyCommand);
 registerCommand(verifyCronCommand);
+registerCommand(tagCompanyCommand);
 registerCommand(devCommand);
 

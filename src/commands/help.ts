@@ -29,7 +29,7 @@ export const helpCommand: Command = {
     for (const cmd of commands) {
       if (['company', 'reg_ref', 'update_ref', 'ref_list'].includes(cmd.name)) {
         categories.user.push(cmd);
-      } else if (['ref_update', 'ref_delete', 'tagunreg', 'verify_cron'].includes(cmd.name)) {
+      } else if (['ref_update', 'ref_delete', 'tagunreg', 'tag_company', 'verify_cron'].includes(cmd.name)) {
         categories.admin.push(cmd);
       } else {
         categories.utility.push(cmd);
@@ -40,8 +40,8 @@ export const helpCommand: Command = {
     const userOrder = ['company', 'reg_ref', 'update_ref', 'ref_list'];
     categories.user.sort((a, b) => userOrder.indexOf(a.name) - userOrder.indexOf(b.name));
 
-    // Sort admin category: ref_update, ref_delete, tagunreg, verify_cron
-    const adminOrder = ['ref_update', 'ref_delete', 'tagunreg', 'verify_cron'];
+    // Sort admin category: ref_update, ref_delete, tagunreg, tag_company, verify_cron
+    const adminOrder = ['ref_update', 'ref_delete', 'tagunreg', 'tag_company', 'verify_cron'];
     categories.admin.sort((a, b) => adminOrder.indexOf(a.name) - adminOrder.indexOf(b.name));
 
     // Sort utility category: dev, ping, help
