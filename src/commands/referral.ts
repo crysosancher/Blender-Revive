@@ -556,9 +556,14 @@ export const companyCommand: Command = {
     const badge = verification.rank === 'A' ? '⭐ ' : (verification.rank === 'B' ? '✅ ' : '❓ ');
 
     // Robust matching for database query — match canonical, space-form, AND underscore-form of the input
+    const canonical = verification.canonicalName;
+    const canonicalSpace = canonical.replace(/_/g, ' ');
     const spaceForm = matchedCompany.replace(/_/g, ' ');
     const records = await referralsCollection.find({
       $or: [
+        { company: canonical },
+        { company: { $regex: new RegExp(`^${escapeRegex(canonical)}$`, 'i') } },
+        { company: { $regex: new RegExp(`^${escapeRegex(canonicalSpace)}$`, 'i') } },
         { company: matchedCompany },
         { company: { $regex: new RegExp(`^${escapeRegex(spaceForm)}$`, 'i') } },
         { company: { $regex: new RegExp(`^${escapeRegex(matchedCompany)}$`, 'i') } },
@@ -983,12 +988,22 @@ export const tagCompanyCommand: Command = {
     const sanityMatch = await resolveCompanySanity(rawTargetCompany);
     const matchedCompany = sanityMatch.matched;
 
+    // Run the matched company through the verifier to get rank, display name, and justification.
+    const verification = await verifyAndNormalizeCompany(matchedCompany || rawTargetCompany);
+    const displayCompanyName = verification.displayName;
+    const badge = verification.rank === 'A' ? '⭐ ' : (verification.rank === 'B' ? '✅ ' : '❓ ');
+
     const referralsCollection = getDb().collection<ReferralDoc>('referrals');
 
     // 5. Fetch all registrations under the matched company (and the raw input as a fallback)
+    const canonical = verification.canonicalName;
+    const canonicalSpace = canonical.replace(/_/g, ' ');
     const spaceForm = matchedCompany.replace(/_/g, ' ');
     const allRegistered = await referralsCollection.find({
       $or: [
+        { company: canonical },
+        { company: { $regex: new RegExp(`^${escapeRegex(canonical)}$`, 'i') } },
+        { company: { $regex: new RegExp(`^${escapeRegex(canonicalSpace)}$`, 'i') } },
         { company: matchedCompany },
         { company: { $regex: new RegExp(`^${escapeRegex(spaceForm)}$`, 'i') } },
         { company: { $regex: new RegExp(`^${escapeRegex(matchedCompany)}$`, 'i') } },
@@ -1001,7 +1016,7 @@ export const tagCompanyCommand: Command = {
       await sendHumanLikeResponse(
         sock,
         jid,
-        { text: `❌ *No registered users found for company:* *${matchedCompany.replace(/_/g, ' ')}*` },
+        { text: `❌ *No registered users found for company:* *${displayCompanyName}*` },
         { quoted: msg }
       );
       return;
@@ -1086,7 +1101,7 @@ export const tagCompanyCommand: Command = {
     }
 
     // 9. Compose the tag message
-    let text = `🏢 *${matchedCompany.replace(/_/g, ' ')}* — ${members.length} ${members.length === 1 ? 'member' : 'members'} in this group:\n\n`;
+    let text = `🏢 *${badge}${displayCompanyName}* — ${members.length} ${members.length === 1 ? 'member' : 'members'} in this group:\n\n`;
     if (sanityMatch.isSuggested) {
       text += `💡 _Showing closest match for "${rawTargetCompany}": ${matchedCompany}_\n\n`;
     }
