@@ -1,4 +1,4 @@
-import { Command, getRegisteredCommands, sendHumanLikeResponse } from './index';
+import { Command, getRegisteredCommands, sendHumanLikeResponse, isSenderDev } from './index';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -17,32 +17,36 @@ export const helpCommand: Command = {
     const jid = msg.key.remoteJid;
     if (!jid) return;
 
+    const isDev = await isSenderDev(sock, msg);
     const commands = getRegisteredCommands();
 
     const categories = {
       user: [] as Command[],
-      admin: [] as Command[],
+      groupAdmin: [] as Command[],
+      dev: [] as Command[],
       utility: [] as Command[],
     };
 
     // Classify
     for (const cmd of commands) {
-      if (['company', 'search', 'reg_ref', 'update_ref', 'ref_list'].includes(cmd.name)) {
+      if (['company', 'search', 'reg_ref', 'update_ref'].includes(cmd.name)) {
         categories.user.push(cmd);
-      } else if (['ref_update', 'ref_delete', 'tagunreg', 'tag_company', 'verify_cron'].includes(cmd.name)) {
-        categories.admin.push(cmd);
+      } else if (cmd.name === 'tag_company') {
+        categories.groupAdmin.push(cmd);
+      } else if (['ref_list', 'ref_update', 'ref_delete', 'tagunreg', 'verify_cron'].includes(cmd.name)) {
+        categories.dev.push(cmd);
       } else {
         categories.utility.push(cmd);
       }
     }
 
-    // Sort user category according to specified order: company, search, reg_ref, update_ref, ref_list
-    const userOrder = ['company', 'search', 'reg_ref', 'update_ref', 'ref_list'];
+    // Sort user category according to specified order: company, search, reg_ref, update_ref
+    const userOrder = ['company', 'search', 'reg_ref', 'update_ref'];
     categories.user.sort((a, b) => userOrder.indexOf(a.name) - userOrder.indexOf(b.name));
 
-    // Sort admin category: ref_update, ref_delete, tagunreg, tag_company, verify_cron
-    const adminOrder = ['ref_update', 'ref_delete', 'tagunreg', 'tag_company', 'verify_cron'];
-    categories.admin.sort((a, b) => adminOrder.indexOf(a.name) - adminOrder.indexOf(b.name));
+    // Sort dev category: ref_list, ref_update, ref_delete, tagunreg, verify_cron
+    const devOrder = ['ref_list', 'ref_update', 'ref_delete', 'tagunreg', 'verify_cron'];
+    categories.dev.sort((a, b) => devOrder.indexOf(a.name) - devOrder.indexOf(b.name));
 
     // Sort utility category: dev, ping, help
     const utilityOrder = ['dev', 'ping', 'help'];
@@ -57,19 +61,31 @@ export const helpCommand: Command = {
       const aliasStr = cmd.aliases && cmd.aliases.length > 0 
         ? ` (or ${cmd.aliases.map(a => `\`${prefix}${a}\``).join(', ')})` 
         : '';
-      const isDisabled = cmd.name === 'ref_list' ? ' _[Temporarily Disabled]_' : '';
-      text += `🔹 *${prefix}${cmd.name}*${aliasStr}${isDisabled}\n`;
+      text += `🔹 *${prefix}${cmd.name}*${aliasStr}\n`;
       text += `   _${cmd.description}_\n\n`;
     }
 
-    text += `⚡ *Developer Admin Commands*\n`;
+    text += `👥 *Group Admin Commands*\n`;
     text += `━━━━━━━━━━━━━━━━━━━━━━━━\n`;
-    for (const cmd of categories.admin) {
+    for (const cmd of categories.groupAdmin) {
       const aliasStr = cmd.aliases && cmd.aliases.length > 0 
         ? ` (or ${cmd.aliases.map(a => `\`${prefix}${a}\``).join(', ')})` 
         : '';
       text += `🔸 *${prefix}${cmd.name}*${aliasStr}\n`;
       text += `   _${cmd.description}_\n\n`;
+    }
+
+    if (isDev) {
+      text += `🛡️ *Developer Admin Commands*\n`;
+      text += `━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+      for (const cmd of categories.dev) {
+        const aliasStr = cmd.aliases && cmd.aliases.length > 0 
+          ? ` (or ${cmd.aliases.map(a => `\`${prefix}${a}\``).join(', ')})` 
+          : '';
+        const isDisabled = cmd.name === 'ref_list' ? ' _[Temporarily Disabled for Users]_' : '';
+        text += `👑 *${prefix}${cmd.name}*${aliasStr}${isDisabled}\n`;
+        text += `   _${cmd.description}_\n\n`;
+      }
     }
 
     text += `ℹ️ *System & Utility Commands*\n`;

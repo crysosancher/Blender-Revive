@@ -430,7 +430,7 @@ export const refListCommand: Command = {
  */
 export const companyCommand: Command = {
   name: 'company',
-  aliases: ['companies', 'campnay', 'compney', 'compnay'],
+  aliases: ['companies', 'campnay', 'compney', 'compnay', 'findcompany', 'find_company', 'find-company'],
   description: 'Lists registered companies or gets users under a specific company.',
   execute: async (sock, msg, args) => {
     const jid = msg.key.remoteJid!;
@@ -1132,12 +1132,28 @@ export const tagCompanyCommand: Command = {
 export const searchCommand: Command = {
   name: 'search',
   aliases: ['find', 'lookup', 'whois', 'userinfo'],
-  description: 'Look up users by @mention, phone tag, or name. /search @user, /search @7070224546, or /search Bhumik.',
+  description: 'Look up users or companies by name, mention, or phone. e.g. /search @user, /search Bhumik, or /search TCS.',
   execute: async (sock, msg, args) => {
     const jid = msg.key.remoteJid!;
 
     // 1. Auth gate — must be registered to look up others (prevents scraping)
     if (!(await requireRegisteredUser(sock, msg))) return;
+
+    // Strategy 0: explicit company prefix routing
+    if (args[0]?.toLowerCase() === 'company') {
+      const companyArgs = args.slice(1);
+      if (companyArgs.length > 0) {
+        await companyCommand.execute(sock, msg, companyArgs);
+      } else {
+        await sendHumanLikeResponse(
+          sock,
+          jid,
+          { text: `⚠️ *Please specify a company name.*\nUsage: \`${prefix}search company <Company Name>\`` },
+          { quoted: msg }
+        );
+      }
+      return;
+    }
 
     const referralsCollection = getDb().collection<ReferralDoc>('referrals');
     const verificationsCol = getDb().collection<CompanyVerificationDoc>('company_verifications');
@@ -1301,15 +1317,43 @@ export const searchCommand: Command = {
       }
     }
 
-    // ─── Strategy 3: name search (substring on `username`) ───
+    // ─── Strategy 3: name or company search ───
     if (rawTag && rawTag.length >= 2 && /[a-zA-Z]/.test(rawTag)) {
+      // 1. Search for matching companies in referrals (active only, case-insensitive substring)
+      let matchingCompanies = await referralsCollection.distinct('company', {
+        company: { $regex: new RegExp(escapeRegex(rawTag), 'i') },
+        deletedAt: { $exists: false }
+      });
+
+      // If no substring matches, try fuzzy matching via resolveCompanySanity
+      if (matchingCompanies.length === 0) {
+        const sanityMatch = await resolveCompanySanity(rawTag);
+        if (sanityMatch.matched) {
+          const companyExists = await referralsCollection.findOne({
+            company: sanityMatch.matched,
+            deletedAt: { $exists: false }
+          } as any);
+          if (companyExists) {
+            matchingCompanies = [sanityMatch.matched];
+          }
+        }
+      }
+
+      // 2. Search for matching users (username substring)
       const nameRegex = new RegExp(escapeRegex(rawTag), 'i');
       const matches = await referralsCollection.find({
         username: nameRegex,
         deletedAt: { $exists: false }
       }).limit(10).toArray();
 
-      if (matches.length === 1) {
+      // Case A: Exactly one company matches and no users match
+      if (matchingCompanies.length === 1 && matches.length === 0) {
+        await companyCommand.execute(sock, msg, [matchingCompanies[0]]);
+        return;
+      }
+
+      // Case B: Exactly one user matches and no companies match
+      if (matchingCompanies.length === 0 && matches.length === 1) {
         await sendHumanLikeResponse(
           sock,
           jid,
@@ -1319,22 +1363,45 @@ export const searchCommand: Command = {
         return;
       }
 
-      if (matches.length > 1) {
-        let text = `🔍 *Found ${matches.length} users matching "${rawTag}":*\n`;
+      // Case C: Mixed or multiple matches
+      if (matchingCompanies.length > 0 || matches.length > 0) {
+        let text = `🔍 *Search Results for "${rawTag}":*\n`;
         text += `━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
-        for (const user of matches) {
-          const lookupKey = user.company.toUpperCase().replace(/[\s_]+/g, '_');
-          const cache = verificationsMap.get(lookupKey);
-          const companyDisplay = cache ? cache.displayName : user.company.replace(/_/g, ' ');
-          const badge = cache
-            ? (cache.rank === 'A' ? '⭐ ' : (cache.rank === 'B' ? '✅ ' : '❓ '))
-            : '❓ ';
-          const rankText = cache && cache.rank !== 'unranked' ? ` (Rank ${cache.rank})` : '';
-          const memberCount = companyCountMap.get(user.company) || 1;
-          const memberText = ` — ${memberCount} ${memberCount === 1 ? 'user' : 'users'}`;
-          text += `👤 *${user.username}* — ${badge}${companyDisplay}${rankText}${memberText}\n\n`;
+
+        if (matchingCompanies.length > 0) {
+          text += `🏢 *Matching Companies:*\n`;
+          for (const company of matchingCompanies) {
+            const lookupKey = company.toUpperCase().replace(/[\s_]+/g, '_');
+            const cache = verificationsMap.get(lookupKey);
+            const displayName = cache ? cache.displayName : company.replace(/_/g, ' ');
+            const badge = cache
+              ? (cache.rank === 'A' ? '⭐ ' : (cache.rank === 'B' ? '✅ ' : '❓ '))
+              : '❓ ';
+            const count = companyCountMap.get(company) || 0;
+            text += `- *${badge}${displayName}* (${count} ${count === 1 ? 'referral' : 'referrals'}) — Type \`${prefix}company ${displayName}\` to view\n`;
+          }
+          text += `\n`;
         }
-        text += `💡 _Tip: Use \`${prefix}search @<user>\` to see a specific user's full card._`;
+
+        if (matches.length > 0) {
+          text += `👤 *Matching Users:*\n`;
+          for (const user of matches) {
+            const lookupKey = user.company.toUpperCase().replace(/[\s_]+/g, '_');
+            const cache = verificationsMap.get(lookupKey);
+            const companyDisplay = cache ? cache.displayName : user.company.replace(/_/g, ' ');
+            const badge = cache
+              ? (cache.rank === 'A' ? '⭐ ' : (cache.rank === 'B' ? '✅ ' : '❓ '))
+              : '❓ ';
+            const rankText = cache && cache.rank !== 'unranked' ? ` (Rank ${cache.rank})` : '';
+            const memberCount = companyCountMap.get(user.company) || 1;
+            const memberText = ` — ${memberCount} ${memberCount === 1 ? 'user' : 'users'}`;
+            text += `- *${user.username}* — ${badge}${companyDisplay}${rankText}${memberText}\n`;
+          }
+          text += `\n`;
+        }
+
+        text += `━━━━━━━━━━━━━━━━━━━━━━━━\n`;
+        text += `💡 _Tip: Use \`${prefix}company <company_name>\` to view company referrals or \`${prefix}search @user\` to see a user's card._`;
 
         await sendHumanLikeResponse(
           sock,
@@ -1351,7 +1418,7 @@ export const searchCommand: Command = {
       sock,
       jid,
       {
-        text: `⚠️ *No matching user found for:* _${rawTag || '(empty)'}_\n\n*Usage:*\n- \`${prefix}search @<user>\` — mention a user\n- \`${prefix}search @7070224546\` — phone number\n- \`${prefix}search Bhumik\` — name (partial match)`
+        text: `⚠️ *No matching user or company found for:* _${rawTag || '(empty)'}_\n\n*Usage:*\n- \`${prefix}company <company_name>\` — search referrals at a company\n- \`${prefix}search @<user>\` — mention a user\n- \`${prefix}search @7070224546\` — phone number\n- \`${prefix}search Bhumik\` — search by name or company`
       },
       { quoted: msg }
     );
