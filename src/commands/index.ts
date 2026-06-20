@@ -341,6 +341,7 @@ import {
   searchCommand
 } from './referral';
 import { devCommand } from './dev';
+import { warnCommand, unwarnCommand, checkWarnCommand } from './warn';
 
 registerCommand(pingCommand);
 registerCommand(helpCommand);
@@ -355,4 +356,7 @@ registerCommand(verifyCronCommand);
 registerCommand(tagCompanyCommand);
 registerCommand(searchCommand);
 registerCommand(devCommand);
+registerCommand(warnCommand);
+registerCommand(unwarnCommand);
+registerCommand(checkWarnCommand);
 

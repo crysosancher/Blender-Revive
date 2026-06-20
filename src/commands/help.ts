@@ -31,7 +31,7 @@ export const helpCommand: Command = {
     for (const cmd of commands) {
       if (['company', 'search', 'reg_ref', 'update_ref'].includes(cmd.name)) {
         categories.user.push(cmd);
-      } else if (cmd.name === 'tag_company') {
+      } else if (['tag_company', 'warn', 'unwarn', 'check-warn'].includes(cmd.name)) {
         categories.groupAdmin.push(cmd);
       } else if (['ref_list', 'ref_update', 'ref_delete', 'tagunreg', 'verify_cron'].includes(cmd.name)) {
         categories.dev.push(cmd);
@@ -43,6 +43,10 @@ export const helpCommand: Command = {
     // Sort user category according to specified order: company, search, reg_ref, update_ref
     const userOrder = ['company', 'search', 'reg_ref', 'update_ref'];
     categories.user.sort((a, b) => userOrder.indexOf(a.name) - userOrder.indexOf(b.name));
+
+    // Sort groupAdmin category: tag_company, warn, unwarn, check-warn
+    const groupAdminOrder = ['tag_company', 'warn', 'unwarn', 'check-warn'];
+    categories.groupAdmin.sort((a, b) => groupAdminOrder.indexOf(a.name) - groupAdminOrder.indexOf(b.name));
 
     // Sort dev category: ref_list, ref_update, ref_delete, tagunreg, verify_cron
     const devOrder = ['ref_list', 'ref_update', 'ref_delete', 'tagunreg', 'verify_cron'];

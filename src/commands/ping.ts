@@ -11,12 +11,29 @@ function toGB(bytes: number): string {
 }
 
 /**
- * Helper to format uptime in hours and minutes.
+ * Helper to format uptime in months, days, hours and minutes.
  */
 function formatUptime(seconds: number): string {
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  return `${h}h ${m}m`;
+  const totalHours = Math.floor(seconds / 3600);
+  if (totalHours < 24) {
+    const m = Math.floor((seconds % 3600) / 60);
+    return `${totalHours}h ${m}m`;
+  } else {
+    const totalDays = Math.floor(totalHours / 24);
+    const h = totalHours % 24;
+    const months = Math.floor(totalDays / 30);
+    const d = totalDays % 30;
+
+    let parts: string[] = [];
+    if (months > 0) {
+      parts.push(`${months}mo`);
+    }
+    if (d > 0 || months > 0) {
+      parts.push(`${d}d`);
+    }
+    parts.push(`${h}h`);
+    return parts.join(' ');
+  }
 }
 
 /**
