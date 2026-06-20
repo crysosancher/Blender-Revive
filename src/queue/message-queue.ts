@@ -74,13 +74,13 @@ export async function queueMessage(msg: proto.IWebMessageInfo): Promise<void> {
 }
 
 /**
- * Retrieves the count of waiting, active, delayed, and paused jobs in the queue.
+ * Retrieves the count of waiting and active jobs in the queue (excluding delayed/repeatable cron jobs).
  */
 export async function getQueueCount(): Promise<number> {
   if (!messageQueue) return 0;
   try {
-    const counts = await messageQueue.getJobCounts('wait', 'active', 'delayed', 'paused');
-    return (counts.wait || 0) + (counts.active || 0) + (counts.delayed || 0) + (counts.paused || 0);
+    const counts = await messageQueue.getJobCounts('wait', 'active');
+    return (counts.wait || 0) + (counts.active || 0);
   } catch (err) {
     console.error('[Queue] Failed to get job counts:', err);
     return 0;
