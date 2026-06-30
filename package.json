@@ -20,7 +20,7 @@
   "license": "ISC",
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
-    "@whiskeysockets/baileys": "^6.7.9",
+    "@whiskeysockets/baileys": "^7.0.0-rc13",
     "bullmq": "^5.8.5",
     "dotenv": "^16.4.5",
     "ioredis": "^5.4.1",

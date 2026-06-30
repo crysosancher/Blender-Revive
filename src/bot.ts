@@ -89,10 +89,11 @@ export async function startWhatsAppBot(): Promise<any> {
 
   // 1b. Capture LID → Phone JID mappings from WhatsApp's phone number sharing protocol.
   // This fires when WhatsApp reveals the phone number behind a LID.
-  sock.ev.on('chats.phoneNumberShare', async ({ lid, jid }) => {
-    console.log(`[Bot] Phone number share captured: ${lid} -> ${jid}`);
-    await storeLidPhoneMapping(lid, jid);
-  });
+  // Note: chats.phoneNumberShare is deprecated/not emitted in Baileys v7.
+  // (sock.ev.on as any)('chats.phoneNumberShare', async ({ lid, jid }: any) => {
+  //   console.log(`[Bot] Phone number share captured: ${lid} -> ${jid}`);
+  //   await storeLidPhoneMapping(lid, jid);
+  // });
 
   // 1c. Capture LID↔Phone mappings from contact sync events.
   // These fire during history sync and whenever contacts are updated.
@@ -202,6 +203,50 @@ export async function startWhatsAppBot(): Promise<any> {
     if (connection === 'open') {
       console.log('[Bot] Connection successfully established with WhatsApp!');
 
+      // Check account reachout timelock status
+      setTimeout(async () => {
+        try {
+          const timelockStatus = await sock.fetchAccountReachoutTimelock();
+          console.log(`[Bot] Reachout Timelock Status:`, JSON.stringify(timelockStatus));
+          if (timelockStatus.isActive) {
+            const endsAt = timelockStatus.timeEnforcementEnds;
+            console.warn(`[Bot] ⚠️ Account is under REACH-OUT TIME-LOCK! Ends at: ${endsAt ? endsAt.toISOString() : 'unknown'}`);
+          } else {
+            console.log('[Bot] ✅ Account is NOT under reach-out time-lock.');
+          }
+        } catch (err) {
+          console.error('[Bot] Failed to fetch reachout timelock status:', err);
+        }
+      }, 3000);
+
+      // Proactively issue privacy tokens for known contacts
+      setTimeout(async () => {
+        try {
+          const lidMapCollection = getDb().collection('lid_phone_map');
+          const allMappings = await lidMapCollection.find({}).toArray();
+          const lids = allMappings.map((m: any) => m.lid).filter((lid: string) => lid && lid.endsWith('@lid'));
+          
+          if (lids.length > 0) {
+            console.log(`[Bot] Proactively issuing privacy tokens for ${lids.length} known contacts...`);
+            // Issue in batches of 10 to avoid overwhelming the server
+            for (let i = 0; i < lids.length; i += 10) {
+              const batch = lids.slice(i, i + 10);
+              try {
+                await sock.issuePrivacyTokens(batch);
+                console.log(`[Bot] Issued privacy tokens batch ${Math.floor(i/10) + 1}/${Math.ceil(lids.length/10)}`);
+              } catch (batchErr: any) {
+                console.warn(`[Bot] Privacy token batch ${Math.floor(i/10) + 1} failed:`, batchErr?.message || batchErr);
+              }
+              // Small delay between batches
+              await new Promise(r => setTimeout(r, 500));
+            }
+            console.log(`[Bot] Privacy token issuance complete.`);
+          }
+        } catch (err) {
+          console.error('[Bot] Proactive token issuance failed (non-fatal):', err);
+        }
+      }, 8000);
+
       // Background: Scan all groups to harvest LID↔Phone participant mappings & usernames.
       // This runs once on each connection open, building the mapping table so
       // DM mentions can resolve LIDs to clickable phone JIDs.
@@ -278,7 +323,7 @@ export async function startWhatsAppBot(): Promise<any> {
           const unregisteredMentions: { targetJid: string }[] = [];
 
           for (const participant of participants) {
-            const cleanedParticipant = cleanJid(participant);
+            const cleanedParticipant = cleanJid(participant.id);
 
             // Skip if the participant is the bot itself
             const isBot = (botJid && cleanedParticipant === botJid) || 

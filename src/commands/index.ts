@@ -63,6 +63,47 @@ export function getMessageText(msg: proto.IWebMessageInfo): string {
 }
 
 /**
+ * Resolves a LID to a phone-based JID using the message key, local database, or USyncQuery.
+ */
+export async function resolveLidToPhone(sock: any, lid: string, msg?: proto.IWebMessageInfo): Promise<string | null> {
+  if (!lid || !lid.endsWith('@lid')) return null;
+
+  // 1. Check senderPn on the message key if available
+  if (msg?.key) {
+    const senderPn = (msg.key as any).senderPn;
+    if (senderPn && senderPn.endsWith('@s.whatsapp.net')) {
+      try {
+        const { storeLidPhoneMapping } = await import('../db/lid-phone-map');
+        await storeLidPhoneMapping(lid, senderPn);
+      } catch (err) {
+        // ignore
+      }
+      return senderPn;
+    }
+  }
+
+  // 2. Check local database cache
+  try {
+    const { getPhoneJidFromLid } = await import('../db/lid-phone-map');
+    const cached = await getPhoneJidFromLid(lid);
+    if (cached) return cached;
+  } catch (err) {
+    // ignore
+  }
+
+  // 3. Query WhatsApp servers via USyncQuery
+  try {
+    const { resolvePhoneFromLid } = await import('../db/lid-phone-map');
+    const resolved = await resolvePhoneFromLid(sock, lid);
+    if (resolved) return resolved;
+  } catch (err) {
+    // ignore
+  }
+
+  return null;
+}
+
+/**
  * Utility to send a WhatsApp message simulating human typing.
  * Sends 'composing' presence, waits a dynamically calculated delay based on message length,
  * sends the message, and resets the presence.
@@ -228,7 +269,7 @@ export function getLevenshteinDistance(a: string, b: string): number {
 }
 
 export async function handleIncomingMessage(sock: any, msg: proto.IWebMessageInfo): Promise<void> {
-  const jid = msg.key.remoteJid;
+  let jid = msg.key.remoteJid;
   if (!jid) return;
 
   // Ignore status updates
@@ -237,10 +278,10 @@ export async function handleIncomingMessage(sock: any, msg: proto.IWebMessageInf
   // Ignore messages sent by the bot itself to prevent infinite loops
   if (msg.key.fromMe) return;
 
+  const isDm = !jid.endsWith('@g.us');
+
   const text = getMessageText(msg).trim();
   if (!text) return;
-
-  const isDm = !jid.endsWith('@g.us');
 
   // Check if message starts with the designated command prefix
   if (!text.startsWith(prefix)) {
