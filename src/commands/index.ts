@@ -1,5 +1,6 @@
 import { proto } from '@whiskeysockets/baileys';
 import dotenv from 'dotenv';
+import { logCommandUsage } from '../db/command-usage';
 
 dotenv.config();
 
@@ -351,11 +352,27 @@ export async function handleIncomingMessage(sock: any, msg: proto.IWebMessageInf
 
   console.log(`[Command] Found and executing: ${prefix}${commandName} from ${msg.pushName || 'User'} in chat ${jid}`);
 
+  const senderJid = msg.key.participant || msg.key.remoteJid!;
+
   try {
     await command.execute(sock, msg, args);
+    logCommandUsage({
+      commandName,
+      senderJid,
+      isGroup: !isDm,
+      groupId: !isDm ? jid : undefined,
+      success: true,
+    });
   } catch (error) {
     console.error(`[Command] Failed to execute ${commandName}:`, error);
-    
+    logCommandUsage({
+      commandName,
+      senderJid,
+      isGroup: !isDm,
+      groupId: !isDm ? jid : undefined,
+      success: false,
+    });
+
     // Notify the chat of the error using a human-like response delay
     await sendHumanLikeResponse(
       sock,
@@ -402,4 +419,3 @@ registerCommand(devCommand);
 registerCommand(warnCommand);
 registerCommand(unwarnCommand);
 registerCommand(checkWarnCommand);
-
