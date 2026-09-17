@@ -254,6 +254,12 @@ export const warnCommand: Command = {
       try {
         await sock.groupParticipantsUpdate(jid, [targetParticipant.id], 'remove');
 
+        // A completed kick starts the member at zero warnings if they rejoin.
+        await warningsCollection.deleteMany({
+          groupId: jid,
+          ...userQuery
+        });
+
         await sendHumanLikeResponse(
           sock,
           jid,

@@ -53,8 +53,8 @@ export const helpCommand: Command = {
     const devOrder = ['ref_list', 'ref_update', 'ref_delete', 'tagunreg', 'verify_cron'];
     categories.dev.sort((a, b) => devOrder.indexOf(a.name) - devOrder.indexOf(b.name));
 
-    // Sort utility category: dev, ping, help
-    const utilityOrder = ['dev', 'ping', 'help'];
+    // Sort utility category: dev, ping, help, question
+    const utilityOrder = ['dev', 'ping', 'help', 'question'];
     categories.utility.sort((a, b) => utilityOrder.indexOf(a.name) - utilityOrder.indexOf(b.name));
 
     // ── Build the help message ──
