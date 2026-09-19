@@ -1,5 +1,5 @@
 import { proto } from '@whiskeysockets/baileys';
-import { Command, sendHumanLikeResponse, isSenderGroupAdmin } from './index';
+import { Command, sendHumanLikeResponse, isSenderDev, isSenderGroupAdmin } from './index';
 import { frameTechnicalQuestion } from '../services/question-framer';
 
 const prefix = process.env.BOT_PREFIX || '/';
@@ -31,11 +31,14 @@ export const questionCommand: Command = {
       return;
     }
 
-    if (!(await isSenderGroupAdmin(sock, msg))) {
+    // 2. Authorisation: developer OR group admin
+    const isDev = await isSenderDev(sock, msg);
+    const isAdmin = !isDev ? await isSenderGroupAdmin(sock, msg) : false;
+    if (!isDev && !isAdmin) {
       await sendHumanLikeResponse(
         sock,
         jid,
-        { text: 'Only group admins can use this command.' },
+        { text: 'Only group admins (or the developer) can use this command.' },
         { quoted: msg }
       );
       return;
