@@ -437,6 +437,7 @@ import { devCommand } from './dev';
 import { warnCommand, unwarnCommand, checkWarnCommand } from './warn';
 import { spamCommand, rmWarnCommand, rmBlacklistCommand, checkSpam } from './spam';
 import { questionCommand } from './question';
+import { leaderboardCommand } from './leaderboard';
 
 registerCommand(pingCommand);
 registerCommand(helpCommand);
@@ -451,6 +452,7 @@ registerCommand(verifyCronCommand);
 registerCommand(tagCompanyCommand);
 registerCommand(searchCommand);
 registerCommand(analyticsCommand);
+registerCommand(leaderboardCommand);
 registerCommand(devCommand);
 registerCommand(warnCommand);
 registerCommand(unwarnCommand);

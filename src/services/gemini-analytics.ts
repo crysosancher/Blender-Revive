@@ -1,6 +1,7 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { getDb } from '../db/mongodb';
 import { sendHumanLikeResponse } from '../commands';
+import { saveDailySummary } from './daily-summary-store';
 
 // Initialize the Google Gen AI SDK
 const apiKey = process.env.GEMINI_API_KEY || '';
@@ -215,6 +216,32 @@ Please output the response exactly in this JSON format (ALL fields must be non-e
         reason: `Most active participant with ${maxCount} messages — keeping the group alive counts as value!`
       };
     }
+
+    // 6d. Persist this day's analytics so weekly/monthly/yearly leaderboards can aggregate it.
+    await saveDailySummary({
+      groupId,
+      totalMessages: messages.length,
+      participantCount: Object.keys(senderCounts).length,
+      mvp: {
+        jid: result.productive?.jid || mostMessagedJid || '',
+        name:
+          result.productive?.name ||
+          (mostMessagedJid ? senderCounts[mostMessagedJid]?.name || 'Unknown' : 'Unknown'),
+        reason: result.productive?.reason || '',
+      },
+      annoying: {
+        topic: result.annoying?.topic || '',
+        jid: result.annoying?.jid || '',
+        name: result.annoying?.name || '',
+        reason: result.annoying?.reason || '',
+      },
+      summary: Array.isArray(result.summary) ? result.summary : [],
+      senderCounts: Object.entries(senderCounts).map(([jid, data]) => ({
+        jid,
+        name: data.name,
+        count: data.count,
+      })),
+    });
 
     // 7. Format output report message
     const mentions: string[] = [];
