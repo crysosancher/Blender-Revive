@@ -34,8 +34,15 @@ export function setupQueue(): Queue {
   // Clean up and schedule repeatable jobs
   messageQueue.getRepeatableJobs().then(async (jobs) => {
     // Remove old repeatable jobs to prevent duplicates or stale cron schedules
+    const repeatableJobNames = [
+      'group-analytics-cron',
+      'company-verification-cron',
+      'weekly-leaderboard-cron',
+      'monthly-leaderboard-cron',
+      'yearly-leaderboard-cron',
+    ];
     for (const job of jobs) {
-      if (job.name === 'group-analytics-cron' || job.name === 'company-verification-cron') {
+      if (repeatableJobNames.includes(job.name)) {
         await messageQueue?.removeRepeatableByKey(job.key);
         console.log(`[Queue] Removed old repeatable job: ${job.name} (${job.pattern})`);
       }
@@ -62,6 +69,39 @@ export function setupQueue(): Queue {
       }
     );
     console.log('[Queue] Repeatable group analytics cron job successfully scheduled (Every day at 11:00 PM IST)');
+
+    // Schedule repeatable weekly leaderboard (every Sunday at 11:00 PM IST)
+    await messageQueue?.add(
+      'weekly-leaderboard-cron',
+      {},
+      {
+        repeat: { pattern: '0 23 * * 0', tz: 'Asia/Kolkata' },
+        jobId: 'weekly-leaderboard-cron-job',
+      }
+    );
+    console.log('[Queue] Repeatable weekly leaderboard cron job scheduled (Sundays at 11:00 PM IST)');
+
+    // Schedule repeatable monthly leaderboard (fires on 28-31; the worker only posts on the last day)
+    await messageQueue?.add(
+      'monthly-leaderboard-cron',
+      {},
+      {
+        repeat: { pattern: '0 23 28-31 * *', tz: 'Asia/Kolkata' },
+        jobId: 'monthly-leaderboard-cron-job',
+      }
+    );
+    console.log('[Queue] Repeatable monthly leaderboard cron job scheduled (last day of month, 11:00 PM IST)');
+
+    // Schedule repeatable yearly leaderboard (Dec 31 at 11:00 PM IST)
+    await messageQueue?.add(
+      'yearly-leaderboard-cron',
+      {},
+      {
+        repeat: { pattern: '0 23 31 12 *', tz: 'Asia/Kolkata' },
+        jobId: 'yearly-leaderboard-cron-job',
+      }
+    );
+    console.log('[Queue] Repeatable yearly leaderboard cron job scheduled (Dec 31, 11:00 PM IST)');
   }).catch((err) => {
     console.error('[Queue] Failed to setup repeatable cron jobs:', err);
   });
@@ -134,6 +174,15 @@ export function setupWorker(getSocket: () => any, concurrency: number = 5): Work
 
       // Handle repeatable group analytics cron job
       if (job.name === 'group-analytics-cron') {
+        // On weekly/monthly/yearly leaderboard days we skip the daily summary so the
+        // group receives only the (more comprehensive) periodic leaderboard post.
+        const { getPeriodicLeaderboardType } = await import('../services/leaderboard');
+        const periodicType = getPeriodicLeaderboardType(new Date());
+        if (periodicType) {
+          console.log(`[Worker] Skipping daily analytics — today is a ${periodicType} leaderboard day.`);
+          return;
+        }
+
         console.log('[Worker] Starting cron task: Group Analytics & Reports...');
         const sock = getSocket();
         if (!sock || !isSocketConnected()) {
@@ -161,6 +210,45 @@ export function setupWorker(getSocket: () => any, concurrency: number = 5): Work
           console.log('[Worker] Cron task complete: Group Analytics.');
         } catch (err) {
           console.error('[Worker] Group analytics cron task failed:', err);
+          throw err;
+        }
+        return;
+      }
+
+      // Handle repeatable periodic leaderboard cron jobs (weekly/monthly/yearly)
+      if (
+        job.name === 'weekly-leaderboard-cron' ||
+        job.name === 'monthly-leaderboard-cron' ||
+        job.name === 'yearly-leaderboard-cron'
+      ) {
+        const { getPeriodicLeaderboardType, runAllPeriodicLeaderboards } = await import('../services/leaderboard');
+
+        const jobToPeriod: Record<string, 'week' | 'month' | 'year'> = {
+          'weekly-leaderboard-cron': 'week',
+          'monthly-leaderboard-cron': 'month',
+          'yearly-leaderboard-cron': 'year',
+        };
+        const requestedPeriod = jobToPeriod[job.name];
+        const periodicType = getPeriodicLeaderboardType(new Date());
+
+        // Collision guard: only the most comprehensive periodic job for today runs,
+        // so e.g. Dec 31 (year + month + maybe Sunday) never posts three times.
+        if (periodicType !== requestedPeriod) {
+          console.log(`[Worker] Skipping ${requestedPeriod} leaderboard — today resolves to '${periodicType || 'none'}'.`);
+          return;
+        }
+
+        const leaderboardSock = getSocket();
+        if (!leaderboardSock || !isSocketConnected()) {
+          throw new Error(`[Worker] Socket is not connected. Skipping ${requestedPeriod} leaderboard cron run.`);
+        }
+
+        console.log(`[Worker] Starting cron task: ${requestedPeriod} leaderboard...`);
+        try {
+          await runAllPeriodicLeaderboards(leaderboardSock, requestedPeriod);
+          console.log(`[Worker] Cron task complete: ${requestedPeriod} leaderboard.`);
+        } catch (err) {
+          console.error(`[Worker] ${requestedPeriod} leaderboard cron task failed:`, err);
           throw err;
         }
         return;

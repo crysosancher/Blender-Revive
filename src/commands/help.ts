@@ -25,6 +25,7 @@ export const helpCommand: Command = {
       user: [] as Command[],
       groupAdmin: [] as Command[],
       dev: [] as Command[],
+      analytics: [] as Command[],
       utility: [] as Command[],
     };
 
@@ -36,6 +37,8 @@ export const helpCommand: Command = {
         categories.groupAdmin.push(cmd);
       } else if (['ref_list', 'ref_update', 'ref_delete', 'tagunreg', 'verify_cron'].includes(cmd.name)) {
         categories.dev.push(cmd);
+      } else if (['leaderboard', 'analytics'].includes(cmd.name)) {
+        categories.analytics.push(cmd);
       } else {
         categories.utility.push(cmd);
       }
@@ -48,6 +51,10 @@ export const helpCommand: Command = {
     // Sort groupAdmin category: tag_company, warn, unwarn, check-warn
     const groupAdminOrder = ['tag_company', 'warn', 'unwarn', 'check-warn'];
     categories.groupAdmin.sort((a, b) => groupAdminOrder.indexOf(a.name) - groupAdminOrder.indexOf(b.name));
+
+    // Sort analytics category: leaderboard, analytics
+    const analyticsOrder = ['leaderboard', 'analytics'];
+    categories.analytics.sort((a, b) => analyticsOrder.indexOf(a.name) - analyticsOrder.indexOf(b.name));
 
     // Sort dev category: ref_list, ref_update, ref_delete, tagunreg, verify_cron
     const devOrder = ['ref_list', 'ref_update', 'ref_delete', 'tagunreg', 'verify_cron'];
@@ -142,6 +149,16 @@ export const helpCommand: Command = {
         text += `👑 *${prefix}${cmd.name}*${aliasStr}${isDisabled}\n`;
         text += `   _${cmd.description}_\n\n`;
       }
+    }
+
+    text += `📊 *Leaderboard & Analytics*\n`;
+    for (const cmd of categories.analytics) {
+        const displayedAliases = cmd.aliases ? cmd.aliases.slice(0, 3) : [];
+        const aliasStr = displayedAliases.length > 0 
+          ? ` (or ${displayedAliases.map(a => `\`${prefix}${a}\``).join(', ')})` 
+          : '';
+      text += `📈 *${prefix}${cmd.name}*${aliasStr}\n`;
+      text += `   _${cmd.description}_\n\n`;
     }
 
     text += `ℹ️ *System & Utility*\n`;
