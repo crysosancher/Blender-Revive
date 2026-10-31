@@ -4,6 +4,7 @@ import { batchResolvePhoneJids, storeLidPhoneMapping } from '../db/lid-phone-map
 import { proto } from '@whiskeysockets/baileys';
 import { verifyAndNormalizeCompany, runDatabaseCompanyNormalization, flushStaleVerifications, CompanyVerificationDoc } from '../services/company-verifier';
 import { resolveCompanySanity, sanitizeCompanyName, escapeRegex } from '../services/company-resolver';
+import { fetchCompanyInsights, CompanyInsights } from '../services/company-insights';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -425,6 +426,48 @@ export const refListCommand: Command = {
 };
 
 /**
+ * Formats the public company insights block (about note, employee strength,
+ * open roles, careers link). Returns an empty string when no data is available.
+ *
+ * @param insights Metrics fetched from the public sources.
+ * @param about    One-line company note (the verifier's cached `justification`).
+ */
+function formatCompanyInsights(insights: CompanyInsights, about?: string): string {
+  const hasMetrics =
+    insights.employeeStrength !== undefined ||
+    insights.openRolesCount !== undefined ||
+    !!insights.careersLink;
+
+  // Nothing useful to show — don't add a block full of placeholders.
+  if (!hasMetrics && !about) return '';
+
+  const lines: string[] = ['🏢 *Company Insights*'];
+
+  if (about) {
+    lines.push(`📝 *About:* ${about}`);
+  }
+
+  // Only render the metric rows when at least one real value exists, so a
+  // company we only have a note for doesn't show three useless dashes.
+  if (hasMetrics) {
+    const employee =
+      insights.employeeStrength !== undefined
+        ? `~${insights.employeeStrength.toLocaleString('en-US')}`
+        : '—';
+    const roles =
+      insights.openRolesCount !== undefined
+        ? insights.openRolesCount.toLocaleString('en-US')
+        : '—';
+
+    lines.push(`👥 *Employee strength:* ${employee}`);
+    lines.push(`💼 *Open roles:* ${roles}`);
+    lines.push(`🔗 *Careers:* ${insights.careersLink || '—'}`);
+  }
+
+  return lines.join('\n');
+}
+
+/**
  * Command: -company [<Company Name>]
  * Lists all registered companies, or shows users registered under a specific company.
  */
@@ -577,13 +620,27 @@ export const companyCommand: Command = {
       deletedAt: { $exists: false }
     } as any).toArray();
 
+    // The verifier already stores a one-sentence company note in
+    // `company_verifications.justification` — reuse it as the "About" blurb
+    // instead of calling another API. Unregistered entries (Student,
+    // Unemployed, junk names) have nothing meaningful to describe.
+    const aboutCompany =
+      verification.status === 'registered' && verification.justification
+        ? verification.justification
+        : undefined;
+
+    // Fetch public company insights (employee strength, open roles, careers link).
+    // Backed by a 24h cache, so repeat queries for the same company are cheap.
+    const insights = await fetchCompanyInsights(canonical, displayCompanyName);
+    const insightsBlock = formatCompanyInsights(insights, aboutCompany);
+
     if (records.length === 0) {
-      await sendHumanLikeResponse(
-        sock,
-        jid,
-        { text: `❌ *No referrals found for company:* *${displayCompanyName}*` },
-        { quoted: msg }
-      );
+      let text = `❌ *No registered referrals found for company:* *${displayCompanyName}*`;
+      if (insightsBlock) {
+        text += `\n\n${insightsBlock}`;
+      }
+      text += `\n\n💡 _Be the first to register:_ \`${prefix}reg_ref ${displayCompanyName}\``;
+      await sendHumanLikeResponse(sock, jid, { text }, { quoted: msg });
       return;
     }
 
@@ -608,10 +665,16 @@ export const companyCommand: Command = {
     if (sanityMatch.isSuggested) {
       text += `💡 _Showing closest match for "${rawTargetCompany}": ${matchedCompany}_\n`;
     }
-    if (verification.justification && !sanityMatch.isSuggested) {
+    // Skip this tip when the same note is already rendered as "About" in the
+    // insights block below, so the message never repeats itself.
+    if (verification.justification && !sanityMatch.isSuggested && !aboutCompany) {
       text += `💡 _${verification.justification}_\n`;
     }
     text += `━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+    if (insightsBlock) {
+      text += `${insightsBlock}\n\n━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+    }
 
     const allMentions: string[] = [];
     const isGroupChat = jid.endsWith('@g.us');
